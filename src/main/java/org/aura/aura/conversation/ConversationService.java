@@ -5,6 +5,7 @@ import com.anthropic.models.messages.Message;
 import com.anthropic.models.messages.MessageCreateParams;
 import com.anthropic.models.messages.MessageParam;
 import lombok.extern.slf4j.Slf4j;
+import org.aura.aura.ResolverPromptProvider;
 import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
@@ -26,21 +27,6 @@ import java.util.stream.Collectors;
 @Slf4j
 public class ConversationService {
 
-    // System prompt is fixed at compile time so it lives at the front of every request's prefix.
-    // Keeping it constant (no interpolated dates/IDs) means it stays byte-identical across calls,
-    // which is the precondition for prompt-cache hits on the shared prefix.
-    private static final String SYSTEM_PROMPT = """
-            You are AURA, a customer support agent for ShopFast, an e-commerce platform.
-            You help customers with: order status and tracking, returns and refunds,
-            account and billing questions.
-
-            Rules:
-            - Be concise, professional, and empathetic.
-            - Never fabricate order data or tracking information.
-            - If you don't know something, say so and offer to escalate.
-            - Always confirm the customer's order number before discussing a specific order.
-            """;
-
     // Pinned to the dated Haiku snapshot as a String literal: support traffic is high-volume and
     // latency-sensitive, so the cheapest/fastest tier fits. The dated ID (not the floating alias)
     // pins behavior so a model refresh can't silently change responses under us.
@@ -59,9 +45,11 @@ public class ConversationService {
     // Constructor injection (not field @Autowired) so the dependency is final, the object is fully
     // initialized once constructed, and the service is trivially unit-testable with a mock client.
     private final AnthropicClient client;
+    private final ResolverPromptProvider promptProvider;
 
-    public ConversationService(AnthropicClient client) {
+    public ConversationService(AnthropicClient client, ResolverPromptProvider promptProvider) {
         this.client = client;
+        this.promptProvider = promptProvider;
     }
 
     /**
@@ -91,7 +79,7 @@ public class ConversationService {
                     .maxTokens(1024L)
                     // system is sent out-of-band from messages so it isn't mistaken for a user turn
                     // and stays a stable, cacheable prefix.
-                    .system(SYSTEM_PROMPT)
+                    .system(promptProvider.systemPrompt())
                     .messages(history)
                     .build();
 

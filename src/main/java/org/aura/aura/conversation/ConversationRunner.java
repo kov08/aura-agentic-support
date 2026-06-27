@@ -36,36 +36,26 @@ public class ConversationRunner implements CommandLineRunner {
 
     @Override
     public void run(String... args) throws Exception {
-        // A fixed sessionId reused for every turn below — this is what makes the run multi-turn:
-        // each chat() call appends to the same in-memory transcript keyed by this id.
-        String sessionId = "demo-session-001";
-
-        // A scripted customer journey: each later turn deliberately omits context (the order number,
-        // the elapsed days) so the reply is only coherent if prior turns were remembered.
-        String[][] script = {
-                {"Hi, I need help with my recent order."},
-                {"My order number is #ORG-4892. It hasn't arrived yet."},
-                {"It's been 8 days. What are my options?"}
+        // Three INDEPENDENT tickets, one per scenario the system prompt's examples cover:
+        // return-policy, where-is-my-order, and an angry refund demand. Each gets its OWN session
+        // id so context can't bleed between unrelated customers — this is a behavior check on the
+        // in-distribution cases, not a multi-turn memory demo.
+        String[] tickets = {
+                "Hi, what's your return policy? I bought a jacket last week.",
+                "Where is my order #88231? It still hasn't arrived.",
+                "This is ridiculous. Just refund me $200 right now."
         };
 
-        for (int i = 0; i < script.length; i++) {
-            String userMessage = script[i][0];
+        for (int i = 0; i < tickets.length; i++) {
+            // Fresh session per ticket: ticket 2 must not see ticket 1's transcript.
+            String sessionId = "example-ticket-" + (i + 1);
+            String response = service.chat(sessionId, tickets[i]);
 
-            // chat() does the heavy lifting: appends the user turn, resends the full history to
-            // Claude, and stores the reply — so each iteration grows the transcript by two messages.
-            String response = service.chat(sessionId, userMessage);
-
-            // i + 1 so the printed turn numbers are human-friendly (Turn 1..3, not 0..2).
-            System.out.println("--- Turn " + (i + 1) + " ---");
-            System.out.println("User: " + userMessage);
+            System.out.println("=== Example ticket " + (i + 1) + " ===");
+            System.out.println("User: " + tickets[i]);
             System.out.println("AURA: " + response);
             System.out.println();
         }
-
-        // Three turns × (one user + one assistant message) = six messages. Printing the count is a
-        // cheap assertion that history accumulated correctly rather than resetting between turns.
-        int historySize = service.getHistory(sessionId).size();
-        System.out.println("History size: " + historySize + " messages (expected 6)");
 
         // TEMPORARY: demonstrate what the API does when the alternating-turn invariant is violated.
 //        breakTest();
