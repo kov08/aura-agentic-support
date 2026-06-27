@@ -40,6 +40,16 @@
             <version>2.40.1</version>
         </dependency>
 
+        <!-- Lombok supplies the @Slf4j annotation used by ConversationService.
+             Version is managed by the spring-boot-starter-parent BOM. optional=true
+             keeps it off the runtime classpath of downstream consumers (it's a
+             compile-time annotation processor only). -->
+        <dependency>
+            <groupId>org.projectlombok</groupId>
+            <artifactId>lombok</artifactId>
+            <optional>true</optional>
+        </dependency>
+
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-devtools</artifactId>
@@ -55,9 +65,34 @@
 
     <build>
         <plugins>
+            <!-- Register Lombok as an annotation processor explicitly. With the newer compiler
+                 plugin, simply having Lombok on the classpath no longer triggers processing, so
+                 @Slf4j wouldn't generate the `log` field without this path. Version is omitted —
+                 it's resolved from the spring-boot-starter-parent dependency management. -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <configuration>
+                    <annotationProcessorPaths>
+                        <path>
+                            <groupId>org.projectlombok</groupId>
+                            <artifactId>lombok</artifactId>
+                        </path>
+                    </annotationProcessorPaths>
+                </configuration>
+            </plugin>
             <plugin>
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-maven-plugin</artifactId>
+                <configuration>
+                    <!-- Keep Lombok out of the repackaged fat jar — it's compile-time only. -->
+                    <excludes>
+                        <exclude>
+                            <groupId>org.projectlombok</groupId>
+                            <artifactId>lombok</artifactId>
+                        </exclude>
+                    </excludes>
+                </configuration>
             </plugin>
         </plugins>
     </build>
