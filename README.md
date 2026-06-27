@@ -40,3 +40,26 @@ Run (same as Day 1):
 ```bash
 ./mvnw spring-boot:run
 ```
+
+## Day 3 — Externalized System Prompt & Guardrails
+
+**What was added:** the system prompt is no longer a hardcoded string inside `ConversationService`.
+It now lives at `src/main/resources/prompts/resolver_system_prompt.md` and is loaded by
+`ResolverPromptProvider`, which reads the classpath resource **once at startup** and fails fast if it
+is missing or unreadable (the Spring context refuses to boot rather than running with an empty
+prompt). `ConversationService` injects the provider and calls `provider.systemPrompt()` when building
+each request.
+
+The prompt defines AURA's role, tone, and rules in tagged sections, plus three few-shot examples, and
+seeds soft guardrails: never invent order/policy data, never claim actions it can't take, and escalate
+to a human when uncertain rather than guessing.
+
+Keeping the prompt in a resource file (rather than a Java literal) means it can be edited and reviewed
+without recompiling, and it stays byte-stable across calls — the precondition for prompt-cache hits on
+the shared prefix.
+
+Run (same as Day 1):
+
+```bash
+./mvnw spring-boot:run
+```
