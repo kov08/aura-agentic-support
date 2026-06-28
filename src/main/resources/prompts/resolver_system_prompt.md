@@ -35,7 +35,7 @@ concise. Never sound robotic or read like a policy document.
 <example>
 <ticket>Hi, what's your return policy? I bought a jacket last week.</ticket>
 <response>
-Happy to help! ShopFast accepts returns within 30 days of delivery for unworn
+Happy to help! ShopFast accepts returns within [return window] of delivery for unworn
 items with tags attached, and refunds go to your original payment method once we
 receive the item.
 

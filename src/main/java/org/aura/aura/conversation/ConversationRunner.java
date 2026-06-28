@@ -5,6 +5,8 @@ import com.anthropic.errors.AnthropicServiceException;
 import com.anthropic.models.messages.Message;
 import com.anthropic.models.messages.MessageCreateParams;
 import com.anthropic.models.messages.MessageParam;
+import org.aura.aura.resolver.Resolution;
+import org.aura.aura.resolver.ResolverService;
 import org.springframework.boot.CommandLineRunner;
 import org.springframework.stereotype.Component;
 
@@ -22,38 +24,44 @@ public class ConversationRunner implements CommandLineRunner {
 
     // Constructor injection (not field @Autowired) so the dependency is final and Spring fails fast
     // at startup if the service can't be wired, rather than NPE-ing on first use.
-    private final ConversationService service;
+//    private final ConversationService service;
 
     // The raw client, injected alongside the service so the temporary breakTest() below can build a
     // deliberately malformed request and hit the API directly, bypassing ConversationService (which
     // would never let an invalid transcript through).
-    private final AnthropicClient client;
+//    private final AnthropicClient client;
 
-    public ConversationRunner(ConversationService service, AnthropicClient client) {
-        this.service = service;
-        this.client = client;
+//    public ConversationRunner(ConversationService service, AnthropicClient client) {
+//        this.service = service;
+//        this.client = client;
+//    }
+
+    private final ResolverService resolver;
+    public ConversationRunner(ResolverService resolver){
+        this.resolver = resolver;
     }
 
     @Override
     public void run(String... args) throws Exception {
-        // Three INDEPENDENT tickets, one per scenario the system prompt's examples cover:
-        // return-policy, where-is-my-order, and an angry refund demand. Each gets its OWN session
-        // id so context can't bleed between unrelated customers — this is a behavior check on the
-        // in-distribution cases, not a multi-turn memory demo.
+        // Tickets fed through the Day 4 resolver. Each is resolved independently — resolve() is
+        // stateless (retrieve → inject → ask), so there's no cross-ticket context to isolate.
         String[] tickets = {
-                "Hi, what's your return policy? I bought a jacket last week.",
-                "Where is my order #88231? It still hasn't arrived.",
-                "This is ridiculous. Just refund me $200 right now."
+                "How long do I have to return something?"
+//                "Hi, what's your return policy? I bought a jacket last week.",
+//                "Where is my order #88231? It still hasn't arrived.",
+//                "This is ridiculous. Just refund me $200 right now."
         };
 
         for (int i = 0; i < tickets.length; i++) {
-            // Fresh session per ticket: ticket 2 must not see ticket 1's transcript.
-            String sessionId = "example-ticket-" + (i + 1);
-            String response = service.chat(sessionId, tickets[i]);
+            // resolve() retrieves matching KB entries, injects them into the prompt, then asks Claude.
+            Resolution resolution = resolver.resolve(tickets[i]);
 
             System.out.println("=== Example ticket " + (i + 1) + " ===");
             System.out.println("User: " + tickets[i]);
-            System.out.println("AURA: " + response);
+            System.out.println("AURA: " + resolution.answer());
+            // KB ids that grounded the answer — e.g. [kb-returns]. Empty means the naive keyword
+            // filter whiffed and Claude answered from the prompt alone.
+            System.out.println("Sources: " + resolution.sourcesUsed());
             System.out.println();
         }
 
