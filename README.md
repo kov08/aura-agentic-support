@@ -63,3 +63,32 @@ Run (same as Day 1):
 ```bash
 ./mvnw spring-boot:run
 ```
+
+## Day 4 — Knowledge Base & Grounded Resolver
+
+**What was added:** a retrieval seam and a `ResolverService` that grounds answers in it, turning AURA
+from "answer from the prompt" into a small retrieve-augment-generate loop.
+
+The seam is the `KnowledgeBase` interface — `List<KbEntry> retrieve(String query)` — and the resolver
+depends only on it, never on a concrete store. Today's implementation, `HardcodedKnowledgeBase`, holds a
+handful of ShopFast facts in memory and retrieves them with a deliberately naive keyword filter (a
+ticket matches an entry only when it contains a word from that entry's title). This is intentional: it
+whiffs on paraphrases — "Can I send my purchase back for my money?" retrieves nothing — which is the
+concrete argument for swapping in a semantic / embedding-backed `KnowledgeBase` later. The resolver
+won't change when we do, because it only knows the interface.
+
+`ResolverService.resolve(String ticket)` runs the loop: retrieve matching entries, inject them into the
+user turn as `<knowledge_base>` context, call Claude, and return a `Resolution(answer, sourcesUsed)`.
+`sourcesUsed` is the grounding receipt — the KB ids that backed the answer (e.g. `[kb-returns]`), or
+empty when retrieval found nothing. Returning a record rather than a bare `String` means later days can
+extend the result — category, urgency, token cost — without refactoring callers.
+
+The few-shot example in the system prompt no longer embeds a specific return window; the figure was
+replaced with a placeholder so the example teaches tone and shape while the actual fact comes from the
+retrieved knowledge base instead of competing with it. `ConversationRunner` now drives the resolver.
+
+Run (same as Day 1):
+
+```bash
+./mvnw spring-boot:run
+```
