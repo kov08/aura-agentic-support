@@ -34,6 +34,22 @@
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter</artifactId>
         </dependency>
+
+        <!-- Spring MVC + embedded Tomcat + Jackson, for the @RestController HTTP seam.
+             This promotes the app from a console runner to a web application. Version is
+             managed by the spring-boot-starter-parent BOM. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+
+        <!-- Bean Validation (Jakarta) + Hibernate Validator, for @Valid/@NotNull-style
+             constraint checking on incoming request DTOs. Version is managed by the
+             spring-boot-starter-parent BOM. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-validation</artifactId>
+        </dependency>
         <dependency>
             <groupId>com.anthropic</groupId>
             <artifactId>anthropic-java</artifactId>
