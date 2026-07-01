@@ -92,3 +92,33 @@ Run (same as Day 1):
 ```bash
 ./mvnw spring-boot:run
 ```
+
+## Day 5 — REST API & Milestone 1
+
+**What was added:** the resolver is now reachable over HTTP. `TicketController`
+(`org.aura.aura.web`) exposes `ResolverService.resolve(...)` behind a validated, versioned endpoint;
+DTOs (`org.aura.aura.web.dto`) define the wire contract and deliberately omit internal telemetry
+(token counts, model); and a `@RestControllerAdvice` (`GlobalExceptionHandler`) maps failures to
+RFC 9457 `ProblemDetail` bodies. Input is validated at the boundary, before any paid model call.
+
+### Resolve a ticket
+`POST /api/v1/tickets/{ticketId}/resolve`
+
+Request:
+```json
+{ "message": "How long do I have to return an item?" }
+```
+Response `200`:
+```json
+{ "ticketId": "T-1001", "resolutionText": "...", "outcome": "RESOLVED", "sourcesUsed": ["kb-returns"] }
+```
+- Input is validated at the boundary (blank/oversized → `400` `application/problem+json`).
+- Errors follow RFC 9457 `ProblemDetail`. `4xx` = client error (don't retry); `5xx` = server/upstream (retry).
+
+**Milestone 1 (v0.1.0):** a callable, validated, grounded ticket-resolution endpoint.
+
+Run (same as Day 1):
+
+```bash
+./mvnw spring-boot:run
+```
