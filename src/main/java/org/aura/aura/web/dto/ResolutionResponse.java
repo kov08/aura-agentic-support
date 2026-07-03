@@ -10,7 +10,11 @@ public record ResolutionResponse(
         String ticketId,
         String resolutionText,
         String outcome,           // "RESOLVED" today; real escalation states arrive Day 16
-        List<String> sourcesUsed  // trust signal: empty list on a confident answer is a smell
+        List<String> sourcesUsed, // trust signal: empty list on a confident answer is a smell
+        // Day 6: the classification that preceded this resolution rides along in the
+        // response. Today it's informational (and the routing hook for Day 7+); exposing
+        // it now means clients integrate against the final shape once, not twice.
+        ClassificationResponse classification
 ) {
     // Mapping lives next to the shape it produces; trivially unit-testable.
     // A test that hands this a Resolution carrying tokensUsed and asserts it is ABSENT
@@ -18,12 +22,13 @@ public record ResolutionResponse(
     //
     // public (not package-private): TicketController lives in the sibling package
     // org.aura.aura.web, and Java package access does not span web -> web.dto.
-    public static ResolutionResponse from(String ticketId, Resolution resolution) {
+    public static ResolutionResponse from(String ticketId, Resolution resolution, ClassificationResponse classification) {
         return new ResolutionResponse(
                 ticketId,
                 resolution.answer(),  // Resolution's accessor for the resolved text
                 "RESOLVED",            // TODO Day 16: map real outcome/escalation flag
-                resolution.sourcesUsed()
+                resolution.sourcesUsed(),
+                classification
         );
     }
 }
