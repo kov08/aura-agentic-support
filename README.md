@@ -122,3 +122,64 @@ Run (same as Day 1):
 ```bash
 ./mvnw spring-boot:run
 ```
+
+## Day 6 — Ticket Classification (Native Structured Outputs)
+
+**What was added:** a classification layer that labels a ticket on three independent axes before
+resolving it. The domain types live in `org.aura.aura.classification`: a `TicketClassification`
+record (`category`, `urgency`, `intent`, plus a `double confidence`) backed by three closed enums
+(`TicketCategory`, `TicketUrgency`, `TicketIntent`). Each record field carries a
+`@JsonPropertyDescription` — those texts are not documentation, they travel *into* the JSON schema
+the model sees and steer what it puts in each field.
+
+`TicketClassificationService` calls `claude-haiku-4-5` (a cheap gate, not the resolver's larger
+model) through the SDK's **native structured outputs** — `MessageCreateParams.builder()...
+outputConfig(TicketClassification.class)`, the GA `output_config.format` surface. This is not tool
+use and not prompt-begged JSON: the API derives a JSON schema from the record and enforces it
+server-side, so the response can never arrive with a misspelled category or a missing field. The
+classifier system prompt is externalized to `classifier_system_prompt.md` (same pattern as the
+resolver prompt) and deliberately carries *semantics only* — the output shape is owned by the schema,
+so restating it in the prompt would just create a second source of truth that could drift.
+
+### Classify a ticket
+`POST /api/v1/tickets/classify`
+
+Request:
+```json
+{ "message": "My jacket arrived ripped. I want my $89 refunded right now." }
+```
+Response `200`:
+```json
+{ "category": "RETURNS_AND_REFUNDS", "urgency": "HIGH", "intent": "REQUEST_ACTION",
+  "confidence": 0.95, "needsHumanReview": false }
+```
+
+The resolve flow now **classifies first, then resolves** — the cheap Haiku call runs ahead of the
+expensive resolution (the routing/prioritization hook for later days), and the classification rides
+along in the resolve response under a `classification` field.
+
+### The reliability ladder
+
+The point of the layer isn't the labels — it's that a low-confidence or failed classification is a
+*safe* outcome, never a crash. `classify()` walks a fixed ladder, and every rung that can't produce a
+trustworthy answer lands on the **same fallback** — `(OTHER, MEDIUM, GET_INFORMATION, 0.0,
+needsHumanReview=true)`, logged at `WARN`, HTTP `200`:
+
+1. **`stop_reason` before parsing.** On `refusal` the content is empty; on `max_tokens` it is
+   truncated. The guard checks `stop_reason` *before* touching `.text()`, so a known API condition
+   becomes a clean fallback instead of a raw parse exception surfacing as a `500`.
+2. **Deserialize.** A clean `end_turn` is guaranteed by the schema to parse into the record.
+3. **Semantic validation.** The schema guarantees *shape* (a number), not *meaning* (a probability):
+   confidence is clamped to `[0, 1]`, and anything below the `0.6` floor falls back to a human.
+
+No retries — this sits in front of a user-facing request, and its failure already has a safe answer,
+so a second call would only double latency (transport-level resilience arrives Day 8). Removing the
+`stop_reason` guard and starving `max_tokens` turns every truncated response into a `500`; with the
+guard, the same requests return `200` with the fallback body — the ladder is exactly what converts an
+upstream surprise into a controlled, human-routed outcome.
+
+Run (same as Day 1):
+
+```bash
+./mvnw spring-boot:run
+```
