@@ -27,7 +27,29 @@ public class ResolverService {
     public Resolution resolve(String ticket){
         List<KbEntry> hits = knowledgeBase.retrieve(ticket);
 
-        // Context
+        Message message = client.messages().create(paramsFor(ticket, hits));
+
+        String answer = message.content().stream()
+                .flatMap(block -> block.text().stream())
+                .map(TextBlock::text)
+                .collect(Collectors.joining());
+
+        return new Resolution(answer, hits.stream().map(KbEntry::id).toList());
+    }
+
+    // Streaming (Day 7) shares the EXACT retrieve-augment step as the blocking path above, so a
+    // streamed answer is grounded identically to a non-streamed one — only the transport (block
+    // vs stream) differs. The streaming caller takes these params and opens createStreaming()
+    // instead of create(); sources aren't returned here because the streaming contract surfaces
+    // usage/stop_reason rather than the KB receipt (Day 9 will persist the full turn).
+    public MessageCreateParams buildStreamingParams(String ticket) {
+        return paramsFor(ticket, knowledgeBase.retrieve(ticket));
+    }
+
+    // Single source of truth for the resolution prompt: model, token cap, system prompt, and the
+    // KB-augmented user turn. Both resolve() and buildStreamingParams() route through here so the
+    // two transports can never drift apart in wording or configuration.
+    private MessageCreateParams paramsFor(String ticket, List<KbEntry> hits) {
         String context = hits.isEmpty()
                 ? "No matching knowledge-base entries found."
                 : hits.stream()
@@ -38,24 +60,15 @@ public class ResolverService {
                 <knowledge_base>
                 %s
                 </knowledge_base>
-                
+
                 customer ticket: %s
                 """.formatted(context, ticket);
 
-        MessageCreateParams params = MessageCreateParams.builder()
+        return MessageCreateParams.builder()
                 .model(Model.CLAUDE_SONNET_4_5)
                 .maxTokens(1024L)
                 .system(prompts.systemPrompt())
                 .addUserMessage(userTurn)
                 .build();
-
-        Message message = client.messages().create(params);
-
-        String answer = message.content().stream()
-                .flatMap(block -> block.text().stream())
-                .map(TextBlock::text)
-                .collect(Collectors.joining());
-
-        return new Resolution(answer, hits.stream().map(KbEntry::id).toList());
     }
 }
