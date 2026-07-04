@@ -4,12 +4,15 @@ import org.aura.aura.classification.ClassificationResult;
 import org.aura.aura.classification.TicketClassificationService;
 import org.aura.aura.resolver.Resolution;
 import org.aura.aura.resolver.ResolverService;
+import org.aura.aura.streaming.TicketStreamingService;
 import org.aura.aura.web.dto.ClassificationResponse;
 import org.aura.aura.web.dto.ClassifyTicketRequest;
 import org.aura.aura.web.dto.ResolutionResponse;
 import org.aura.aura.web.dto.ResolveTicketRequest;
 import jakarta.validation.Valid;
+import org.springframework.http.MediaType;
 import org.springframework.web.bind.annotation.*;
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 // Driving adapter: translates HTTP <-> domain. Contains NO business logic.
 // Litmus test: delete this class, drive the services from a test -> zero behavior lost.
@@ -19,10 +22,14 @@ class TicketController {
 
     private final ResolverService resolverService; // constructor injection -> final, testable
     private final TicketClassificationService classificationService;
+    private final TicketStreamingService streamingService;
 
-    TicketController(ResolverService resolverService, TicketClassificationService classificationService) {
+    TicketController(ResolverService resolverService,
+                     TicketClassificationService classificationService,
+                     TicketStreamingService streamingService) {
         this.resolverService = resolverService;
         this.classificationService = classificationService;
+        this.streamingService = streamingService;
     }
 
     // POST, not GET: resolving has side effects (a paid model call) and must not be cached as a safe read.
@@ -38,6 +45,23 @@ class TicketController {
         ClassificationResult classification = classificationService.classify(request.message());
         Resolution resolution = resolverService.resolve(request.message());
         return ResolutionResponse.from(ticketId, resolution, ClassificationResponse.from(classification));
+    }
+
+    // Streaming twin of /resolve: same classify-then-resolve pipeline, but the answer is pushed
+    // token-by-token over Server-Sent Events (produces text/event-stream) instead of returned as
+    // one JSON blob. Returning an SseEmitter tells Spring to keep the response open and hand it to
+    // the pump thread; this controller method returns almost immediately.
+    //
+    // @Valid still runs FIRST, on the servlet thread, BEFORE the emitter exists — so a bad request
+    // is rejected as a normal application/problem+json 400 by the Day 5 advice, never as a
+    // half-opened stream. The two error formats stay cleanly separated: pre-stream failures are
+    // REST ProblemDetail, mid-stream failures are the "error" SSE frame.
+    @PostMapping(value = "/{ticketId}/resolve/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    SseEmitter resolveStream(
+            @PathVariable String ticketId,
+            @Valid @RequestBody ResolveTicketRequest request
+    ) {
+        return streamingService.resolveStreaming(ticketId, request);
     }
 
     // Classification as its own endpoint: lets triage tooling (dashboards, queue routers)
