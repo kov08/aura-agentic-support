@@ -20,7 +20,15 @@ public class AuraApplication {
     // across every request thread.
     @Bean
     public AnthropicClient anthropicClient() {
-        return AnthropicOkHttpClient.fromEnv();
+        return AnthropicOkHttpClient.builder()
+                // fromEnv() on the builder loads ANTHROPIC_API_KEY (and any other ANTHROPIC_*
+                // settings) from the environment, exactly as the old fromEnv() shortcut did —
+                // it just leaves the builder open so we can override defaults below.
+                .fromEnv()
+                // ADR-012: Resilience4j owns the full retry policy. SDK retries disabled
+                // to prevent layered-retry multiplication (SDK 3 × app 3 = 9 calls/request).
+                .maxRetries(0)
+                .build();
     }
 
     // Day 1 smoke test — kept as a comment to document the progression. It proved the raw
