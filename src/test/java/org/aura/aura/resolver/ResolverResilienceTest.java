@@ -1,0 +1,175 @@
+package org.aura.aura.resolver;
+
+import com.anthropic.client.AnthropicClient;
+import com.anthropic.core.JsonValue;
+import com.anthropic.core.http.Headers;
+import com.anthropic.errors.BadRequestException;
+import com.anthropic.errors.RateLimitException;
+import com.anthropic.models.messages.Message;
+import com.anthropic.models.messages.MessageCreateParams;
+import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry;
+import org.aura.aura.ResolverPromptProvider;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.autoconfigure.EnableAutoConfiguration;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Import;
+import org.springframework.test.context.TestPropertySource;
+
+import java.util.List;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.reset;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+
+/**
+ * Behavioural tests for the Day 8 resilience policy on {@link ResolverService#resolve(String)}. Each
+ * test name states one sentence of the policy; together they ARE the policy's documentation.
+ *
+ * <p>These run against a real (sliced) Spring context, not a hand-constructed {@code new
+ * ResolverService(...)} — that is the whole point. The {@code @Retry}/{@code @CircuitBreaker}
+ * behaviour lives in the Spring AOP proxy, so it only exists when the bean is proxied. A plain
+ * constructor call (see {@link ResolverServiceTest}) would silently exercise no resilience at all.
+ *
+ * <p>The context is deliberately narrow: it imports only {@link ResolverService} and its collaborators
+ * plus Resilience4j's autoconfiguration. Booting the whole app instead would drag in the
+ * {@code ConversationRunner} CommandLineRunner, which fires a live resolve on startup.
+ */
+@SpringBootTest(
+        classes = ResolverResilienceTest.ResilienceTestConfig.class,
+        webEnvironment = SpringBootTest.WebEnvironment.NONE)
+@TestPropertySource(properties = {
+        // Keep the REAL policy (the transient allowlist, the breaker thresholds) from application.yml,
+        // but collapse the back-off so the retry test asserts a COUNT without sleeping ~3s for it.
+        "resilience4j.retry.instances.anthropicApi.wait-duration=10ms",
+        "resilience4j.retry.instances.anthropicApi.enable-exponential-backoff=false"
+})
+class ResolverResilienceTest {
+
+    private static final String TICKET = "How long do I have to return something?";
+
+    @Configuration(proxyBeanMethods = false)
+    @EnableAutoConfiguration // pulls in Resilience4j + Spring AOP autoconfiguration, and application.yml binding
+    @Import({ResolverService.class, ResolverPromptProvider.class, HardcodedKnowledgeBase.class})
+    static class ResilienceTestConfig {
+        // The one external dependency is faked. Deep stubs let client.messages().create(...) be stubbed
+        // without naming the intermediate service type. Autowired into the test as the SAME instance.
+        @Bean
+        AnthropicClient anthropicClient() {
+            return mock(AnthropicClient.class, RETURNS_DEEP_STUBS);
+        }
+    }
+
+    @Autowired
+    AnthropicClient client;
+
+    @Autowired
+    ResolverService resolver; // the AOP-proxied bean — annotations are live here
+
+    @Autowired
+    CircuitBreakerRegistry circuitBreakers;
+
+    @BeforeEach
+    void resetSharedState() {
+        // Both the mock and the breaker are context-scoped singletons shared across test methods.
+        // Reset both so one test's failures can't bleed into the next (e.g. push the breaker toward
+        // OPEN, or leave stale stubbing). Reset in @BeforeEach, not @AfterEach, so each test starts
+        // from a known CLOSED breaker regardless of JUnit's method order.
+        reset(client);
+        circuitBreakers.circuitBreaker("anthropicApi").reset();
+    }
+
+    // POLICY: a transient rate-limit is retried, and a call that succeeds within the attempt budget
+    // returns the real answer. Two 429s then a success ⇒ exactly three network attempts.
+    @Test
+    void retriesOnRateLimitThenSucceeds() {
+        Message ok = mock(Message.class);
+        when(ok.content()).thenReturn(List.of());
+        when(client.messages().create(any(MessageCreateParams.class)))
+                .thenThrow(rateLimited())
+                .thenThrow(rateLimited())
+                .thenReturn(ok);
+
+        Resolution resolution = resolver.resolve(TICKET);
+
+        // Succeeded on the third attempt: a normal, grounded RESOLVED answer — NOT an escalation.
+        assertThat(resolution.status()).isEqualTo(ResolutionStatus.RESOLVED);
+        assertThat(resolution.sourcesUsed()).containsExactly("kb-returns");
+        // The retry actually re-called Claude: 1 original + 2 retries = 3 (max-attempts is a total).
+        verify(client.messages(), times(3)).create(any(MessageCreateParams.class));
+    }
+
+    // POLICY: a permanent error is NOT retried — it propagates. A 400 is our malformed request;
+    // retrying it as-is only wastes calls. The absence-of-retry is the assertion: exactly one attempt.
+    @Test
+    void doesNotRetryOnBadRequest() {
+        when(client.messages().create(any(MessageCreateParams.class)))
+                .thenThrow(badRequest());
+
+        // Propagates (does not get swallowed into a bogus escalation) — the fallback is typed to the
+        // breaker-open exception only, so a permanent error flows straight through to the caller.
+        assertThatThrownBy(() -> resolver.resolve(TICKET))
+                .isInstanceOf(BadRequestException.class);
+
+        verify(client.messages(), times(1)).create(any(MessageCreateParams.class));
+    }
+
+    // POLICY: a transient failure that never clears within the attempt budget degrades to human
+    // escalation, NOT a 5xx. Three 429s exhaust the retries; the caller still gets an ESCALATED result
+    // (a 200-worthy degraded answer) rather than the exception. Contrast doesNotRetryOnBadRequest: a
+    // permanent error is not on the transient allowlist, so it propagates instead of degrading.
+    @Test
+    void escalatesWhenRetriesExhausted() {
+        when(client.messages().create(any(MessageCreateParams.class)))
+                .thenThrow(rateLimited())
+                .thenThrow(rateLimited())
+                .thenThrow(rateLimited());
+
+        Resolution resolution = resolver.resolve(TICKET);
+
+        assertThat(resolution.status()).isEqualTo(ResolutionStatus.ESCALATED_TO_HUMAN);
+        // Full retry budget spent (3 attempts) before degrading — not a silent single-shot give-up.
+        verify(client.messages(), times(3)).create(any(MessageCreateParams.class));
+    }
+
+    // POLICY: when the breaker is OPEN, resolve short-circuits to human escalation without touching
+    // the network. Drive the breaker OPEN via the registry (deterministic — no need to manufacture a
+    // failure storm), then assert the degraded outcome and that Claude was never called.
+    @Test
+    void fallsBackToHumanEscalationWhenCircuitOpen() {
+        circuitBreakers.circuitBreaker("anthropicApi").transitionToOpenState();
+
+        Resolution resolution = resolver.resolve(TICKET);
+
+        assertThat(resolution.status()).isEqualTo(ResolutionStatus.ESCALATED_TO_HUMAN);
+        verify(client.messages(), never()).create(any(MessageCreateParams.class));
+    }
+
+    // --- helpers: real SDK exception instances of the exact types the policy keys on ----------------
+    // Built via the SDK builders (headers + body are required) so they are genuine RateLimitException /
+    // BadRequestException instances — that is what Resilience4j's allowlist matching sees at runtime.
+
+    private static RateLimitException rateLimited() {
+        return RateLimitException.builder()
+                .headers(Headers.builder().build())
+                .body(JsonValue.from("rate_limited"))
+                .build();
+    }
+
+    private static BadRequestException badRequest() {
+        return BadRequestException.builder()
+                .headers(Headers.builder().build())
+                .body(JsonValue.from("bad_request"))
+                .build();
+    }
+}
