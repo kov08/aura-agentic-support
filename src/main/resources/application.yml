@@ -1,0 +1,46 @@
+spring:
+  application:
+    name: aura
+
+# --- Resilience4j: one dependency (Claude / the Anthropic API), two policies -------------------
+# Both instances are named "anthropicApi" on purpose: the retry and the breaker are two policies on
+# the SAME dependency, and the shared name keeps this file telling that story at a glance. The
+# annotations live on ResolverService.resolve(...).
+resilience4j:
+  retry:
+    instances:
+      anthropicApi:
+        max-attempts: 3                     # TOTAL attempts (1 original + up to 2 retries), not "3 retries"
+        wait-duration: 1s
+        enable-exponential-backoff: true
+        exponential-backoff-multiplier: 2   # waits ~1s, ~2s between attempts
+        enable-randomized-wait: true        # jitter: spreads retries so a fleet doesn't retry in lockstep
+        # ALLOWLIST, not a denylist. Only these transient Anthropic SDK exceptions are retried;
+        # anything not listed (a permanent 400/401/403/404/422, or any future/unknown exception type)
+        # is NOT retried. That default — "unknown ⇒ don't retry" — is the safe one: it fails closed.
+        # A denylist would fail OPEN, retrying unknown errors, which is exactly how a future
+        # non-idempotent operation (the Day 17 refund tool) would get silently double-fired.
+        retry-exceptions:
+          - com.anthropic.errors.RateLimitException     # HTTP 429 — rate limited
+          - com.anthropic.errors.InternalServerException # HTTP 5xx incl. 529 overloaded
+          - com.anthropic.errors.AnthropicIoException    # connection reset / socket timeout (no HTTP status)
+  circuitbreaker:
+    instances:
+      anthropicApi:
+        sliding-window-size: 10
+        # REQUIRED with a small window: the default minimum-number-of-calls is 100, but the count-based
+        # window caps recorded calls at sliding-window-size (10). 100 > 10 means the breaker could never
+        # gather enough calls to evaluate its failure rate — it would stay CLOSED forever. Cap it below
+        # the window so the rate is actually computed once we've seen a handful of calls.
+        minimum-number-of-calls: 5
+        failure-rate-threshold: 50               # % of the window that must fail for the breaker to OPEN
+        wait-duration-in-open-state: 30s
+        permitted-number-of-calls-in-half-open-state: 3
+        # The breaker tracks the DEPENDENCY's health, so it counts only the same transient failures the
+        # retry cares about. A permanent 400 is OUR malformed request, not Claude being down — letting a
+        # burst of those trip the breaker would escalate every ticket to a human over a bug on our side.
+        # Same taxonomy as retry-exceptions above, by design.
+        record-exceptions:
+          - com.anthropic.errors.RateLimitException
+          - com.anthropic.errors.InternalServerException
+          - com.anthropic.errors.AnthropicIoException

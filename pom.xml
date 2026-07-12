@@ -56,6 +56,33 @@
             <version>2.40.1</version>
         </dependency>
 
+        <!-- Resilience4j Spring Boot integration: brings the @Retry/@CircuitBreaker/
+             @RateLimiter annotations plus the application.yml config binding
+             (resilience4j.retry.instances.*, resilience4j.circuitbreaker.instances.*, ...).
+             We use the spring-boot4 module, NOT the more commonly documented spring-boot3
+             one — this project runs on spring-boot-starter-parent 4.1.0 (Spring Framework 7 /
+             Jakarta EE 11), and spring-boot4:2.4.0 targets spring-boot-autoconfigure 4.x while
+             spring-boot3 targets Boot 3.x. Version is pinned explicitly because Resilience4j
+             is a third-party library not covered by the spring-boot-starter-parent BOM. -->
+        <dependency>
+            <groupId>io.github.resilience4j</groupId>
+            <artifactId>resilience4j-spring-boot4</artifactId>
+            <version>2.4.0</version>
+        </dependency>
+
+        <!-- Spring AOP starter. Required — and easy to forget: the Resilience4j annotations
+             above are applied through Spring AOP proxies. Without an AOP starter on the classpath
+             the annotations are silently ignored: no build error, no retry, no circuit breaker —
+             just wrong runtime behavior. NOTE: Spring Boot 4 renamed the classic
+             spring-boot-starter-aop to spring-boot-starter-aspectj (the old coordinate stops at
+             the 4.0.0-M2 milestone and is absent from the 4.1.0 BOM). This starter pulls in
+             spring-aop + aspectjweaver, which is what the proxies need. Version is managed by the
+             spring-boot-starter-parent BOM. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-aspectj</artifactId>
+        </dependency>
+
         <!-- Lombok supplies the @Slf4j annotation used by ConversationService.
              Version is managed by the spring-boot-starter-parent BOM. optional=true
              keeps it off the runtime classpath of downstream consumers (it's a
