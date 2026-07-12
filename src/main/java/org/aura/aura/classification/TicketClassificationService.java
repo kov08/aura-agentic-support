@@ -1,12 +1,17 @@
 package org.aura.aura.classification;
 
 import com.anthropic.client.AnthropicClient;
+import com.anthropic.errors.AnthropicIoException;
+import com.anthropic.errors.InternalServerException;
+import com.anthropic.errors.RateLimitException;
 import com.anthropic.models.messages.MessageCreateParams;
 import com.anthropic.models.messages.Model;
 import com.anthropic.models.messages.StopReason;
 import com.anthropic.models.messages.StructuredMessage;
 import com.anthropic.models.messages.StructuredMessageCreateParams;
 import com.anthropic.models.messages.StructuredTextBlock;
+import io.github.resilience4j.circuitbreaker.CallNotPermittedException;
+import io.github.resilience4j.circuitbreaker.annotation.CircuitBreaker;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
@@ -32,6 +37,12 @@ public class TicketClassificationService {
         this.prompts = prompts;
     }
 
+    // Shares the SAME "anthropicApi" circuit breaker as ResolverService.resolve — classify and resolve
+    // hit one dependency (the Anthropic API), so one breaker should carry its health and both call
+    // sites should fast-fail together. classify runs FIRST in the request, so leaving it unprotected
+    // made it the weakest link: a Claude outage threw here and 502'd the whole request before resolve's
+    // own resilience was ever reached. NOTE: no @Retry — see onClaudeUnavailable for why.
+    @CircuitBreaker(name = "anthropicApi", fallbackMethod = "onClaudeUnavailable")
     public ClassificationResult classify(String ticketText) {
         // Haiku, not Sonnet: classification is a cheap gate that runs before EVERY
         // resolution, so it must be fast and cheap; the closed enum schema does the
@@ -86,6 +97,30 @@ public class TicketClassificationService {
                 ? raw
                 : new TicketClassification(raw.category(), raw.urgency(), raw.intent(), confidence);
         return new ClassificationResult(classification, false);
+    }
+
+    // Circuit-breaker fallback. classify() already OWNS a safe degraded answer — the human-review
+    // ClassificationResult below — so a Claude transport failure, or a tripped shared breaker, routes
+    // straight to it instead of surfacing as a 5xx and killing the request before resolve() is reached.
+    //
+    // ALLOWLIST, same taxonomy as application.yml (429 / 5xx / connection), plus the breaker-open
+    // CallNotPermittedException. Everything else — a permanent 400/401/403/404/422, or any unknown
+    // throwable — is RETHROWN: silently relabelling a broken API key as "route to a human" forever
+    // would bury a real operational bug behind a WARN log. Fail loud on our mistakes, degrade only on
+    // the dependency's.
+    //
+    // No @Retry on classify by design: it is a cheap pre-gate whose failure already has a safe answer,
+    // so a second model call would only add latency in front of every user request. The shared breaker
+    // still gives it fast-fail during an outage for free — resolve()'s retries feed the same breaker.
+    @SuppressWarnings("unused") // invoked reflectively by the Resilience4j @CircuitBreaker aspect
+    private ClassificationResult onClaudeUnavailable(String ticketText, Throwable cause) throws Throwable {
+        if (cause instanceof CallNotPermittedException
+                || cause instanceof AnthropicIoException
+                || cause instanceof RateLimitException
+                || cause instanceof InternalServerException) {
+            return fallback("Claude unavailable (" + cause.getClass().getSimpleName() + ")");
+        }
+        throw cause;
     }
 
     // One fallback for every failure path: neutral labels, confidence 0.0 (we know

@@ -3,6 +3,7 @@ package org.aura.aura.resolver;
 import com.anthropic.client.AnthropicClient;
 import com.anthropic.models.messages.Message;
 import com.anthropic.models.messages.MessageCreateParams;
+import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry;
 import org.aura.aura.ResolverPromptProvider;
 import org.junit.jupiter.api.Test;
 
@@ -38,7 +39,14 @@ class ResolverServiceTest {
 
         // Real KB on purpose: the point is that a returns-phrased ticket actually retrieves
         // kb-returns through the naive keyword filter.
-        ResolverService resolver = new ResolverService(client, prompts, new HardcodedKnowledgeBase());
+        //
+        // Constructed directly (no Spring proxy), so the @Retry/@CircuitBreaker annotations do NOT
+        // fire here — this stays a pure unit test of the retrieve-then-record wiring. The breaker
+        // registry is a required constructor arg only; an unused default instance satisfies it. The
+        // resilience BEHAVIOUR is proven separately in ResolverResilienceTest, which drives the real
+        // AOP proxy through a Spring context.
+        ResolverService resolver = new ResolverService(
+                client, prompts, new HardcodedKnowledgeBase(), CircuitBreakerRegistry.ofDefaults());
 
         Resolution resolution = resolver.resolve("How long do I have to return something?");
 

@@ -8,6 +8,7 @@ import com.anthropic.models.messages.MessageParam;
 import org.aura.aura.resolver.Resolution;
 import org.aura.aura.resolver.ResolverService;
 import org.springframework.boot.CommandLineRunner;
+import org.springframework.context.annotation.Profile;
 import org.springframework.stereotype.Component;
 
 import java.util.List;
@@ -18,7 +19,12 @@ import java.util.List;
  *
  * <p>The same sessionId is reused across all turns, which is the whole point: it proves the service
  * accumulates context server-side and that turn 3 can "see" the order number from turn 2.
+ *
+ * <p>@Profile("!test"): this is a dev-time demo that fires a LIVE Claude call on startup. Excluding it
+ * from the "test" profile keeps it out of any @SpringBootTest context (e.g. AuraApplicationTests),
+ * which would otherwise make a real API call — and fail with a 401 whenever no key is present (CI).
  */
+@Profile("!test")
 @Component
 public class ConversationRunner implements CommandLineRunner {
 
