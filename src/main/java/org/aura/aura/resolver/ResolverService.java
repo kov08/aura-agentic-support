@@ -4,10 +4,13 @@ import com.anthropic.client.AnthropicClient;
 import com.anthropic.errors.AnthropicIoException;
 import com.anthropic.errors.InternalServerException;
 import com.anthropic.errors.RateLimitException;
+import com.anthropic.models.messages.CacheControlEphemeral;
 import com.anthropic.models.messages.Message;
 import com.anthropic.models.messages.MessageCreateParams;
 import com.anthropic.models.messages.Model;
 import com.anthropic.models.messages.TextBlock;
+import com.anthropic.models.messages.TextBlockParam;
+import com.anthropic.models.messages.Usage;
 import io.github.resilience4j.circuitbreaker.CallNotPermittedException;
 import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry;
 import io.github.resilience4j.circuitbreaker.annotation.CircuitBreaker;
@@ -26,6 +29,19 @@ public class ResolverService {
     // One dependency (Claude), one shared instance name — the retry policy and the breaker policy in
     // application.yml both bind to "anthropicApi", so the config reads as two views of one dependency.
     private static final String CLAUDE = "anthropicApi";
+
+    // The ANSWER-AFFECTING request shape, exposed as the SINGLE SOURCE OF TRUTH for both the request
+    // (paramsFor) and the Day 9 cache key (CachedResolutionService → CacheKeyFactory). Deriving the key
+    // from these same constants is what makes a code edit here self-invalidating: bump MAX_TOKENS and
+    // every previously-truncated cached answer is orphaned by construction (ADR-019). The system prompt
+    // is the fourth such input; it comes from the shared ResolverPromptProvider, which both this service
+    // (paramsFor) and CachedResolutionService read — one source, so key and request can't drift.
+    public static final String MODEL_ID = Model.CLAUDE_SONNET_4_5.asString();
+    public static final long MAX_TOKENS = 2048L;
+    // Set EXPLICITLY (1.0 is also the API default, so this is a no-op behaviourally) precisely so the
+    // cache key can fold in a REAL request parameter rather than a fiction: temperature is
+    // answer-affecting, and a silent default would be un-keyable.
+    public static final double TEMPERATURE = 1.0;
 
     private final AnthropicClient client;
     private final ResolverPromptProvider prompts;
@@ -65,6 +81,7 @@ public class ResolverService {
         List<KbEntry> hits = knowledgeBase.retrieve(ticket);
 
         Message message = client.messages().create(paramsFor(ticket, hits));
+        logUsage(message);
 
         String answer = message.content().stream()
                 .flatMap(block -> block.text().stream())
@@ -116,6 +133,22 @@ public class ResolverService {
                 ResolutionStatus.ESCALATED_TO_HUMAN);
     }
 
+    // ADR-020: prompt-cache observability. cacheReadInputTokens > 0 means the static system-prompt
+    // prefix was served from Anthropic's 5-min ephemeral cache (a hit, ~90% cheaper on that prefix);
+    // cacheCreationInputTokens > 0 means this call WROTE the prefix (a ~25% surcharge that the next
+    // call within 5 min recoups). Both SDK fields are Optional — absent on an uncached call — so
+    // .orElse(0L). This is best-effort telemetry: a resolution we already paid for and obtained must
+    // never fail because usage couldn't be read, so a missing usage block degrades to "no log", never
+    // an error (same fail-open spirit as the Day 9 cache).
+    private void logUsage(Message message) {
+        Usage usage = message.usage();
+        if (usage == null) return;
+        log.info("resolver usage — inputTokens={}, cacheCreationInputTokens={}, cacheReadInputTokens={}",
+                usage.inputTokens(),
+                usage.cacheCreationInputTokens().orElse(0L),
+                usage.cacheReadInputTokens().orElse(0L));
+    }
+
     // Streaming (Day 7) shares the EXACT retrieve-augment step as the blocking path above, so a
     // streamed answer is grounded identically to a non-streamed one — only the transport (block
     // vs stream) differs. The streaming caller takes these params and opens createStreaming()
@@ -144,9 +177,20 @@ public class ResolverService {
                 """.formatted(context, ticket);
 
         return MessageCreateParams.builder()
-                .model(Model.CLAUDE_SONNET_4_5)
-                .maxTokens(1024L)
-                .system(prompts.systemPrompt())
+                .model(Model.CLAUDE_SONNET_4_5)   // MODEL_ID = this constant's .asString(); one source, no drift
+                .maxTokens(MAX_TOKENS)
+                .temperature(TEMPERATURE)
+                // ADR-020: mark the static system prompt (rules + few-shot + hardcoded KB — the STABLE
+                // prefix) with an ephemeral cache_control breakpoint. Replaces the plain .system(String).
+                .systemOfTextBlockParams(List.of(
+                        TextBlockParam.builder()
+                                .text(prompts.systemPrompt())
+                                // Breakpoint on the LAST block that is byte-identical across requests. Anything
+                                // volatile (timestamp, ticket ID) at or before this line would mean paying a
+                                // cache write on every call and never getting a read.
+                                .cacheControl(CacheControlEphemeral.builder().build())  // ephemeral 5-min TTL; hits refresh it free
+                                .build()))
+                // The ticket goes in messages — AFTER the breakpoint, never cached.
                 .addUserMessage(userTurn)
                 .build();
     }

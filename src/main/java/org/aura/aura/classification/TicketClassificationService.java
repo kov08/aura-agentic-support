@@ -54,6 +54,10 @@ public class TicketClassificationService {
         StructuredMessageCreateParams<TicketClassification> params = MessageCreateParams.builder()
                 .model(Model.CLAUDE_HAIKU_4_5)
                 .maxTokens(256L)
+                // Deliberately NO cache_control here: Haiku 4.5's minimum cacheable prefix is 4,096
+                // tokens; this prompt is far below it. Below-minimum requests are processed WITHOUT
+                // caching and WITHOUT error — the marker would be a silent no-op implying a saving
+                // that doesn't exist (ADR-020).
                 .system(prompts.systemPrompt())
                 .outputConfig(TicketClassification.class)
                 .addUserMessage(ticketText)
