@@ -273,3 +273,80 @@ Run (same as Day 1):
 ```bash
 ./mvnw spring-boot:run
 ```
+## Day 9 — Two-Layer Caching (Redis response cache + Anthropic prompt-prefix cache)
+
+**What was added:** two independent caches that attack cost from opposite ends, plus the timeout
+tuning that keeps the first one from becoming an availability dependency. The key insight is that the
+two layers operate on **different denominators** and can never both fire on the same request.
+
+### Layer 1 — Redis response cache (explicit cache-aside, ADR-018)
+
+`CachedResolutionService` wraps the resolver: it builds a key, checks Redis, and only on a miss calls
+`ResolverService.resolve(...)`. A hit skips the paid Sonnet call entirely. Deliberately hand-rolled
+cache-aside — no `@Cacheable`/`spring-cache` — so the ordering and fail behaviour are explicit.
+
+- **The cache is checked *before* the resilience stack, and that ordering is the design.** A hit is
+  not a call to Anthropic, so it must not occupy a slot in the breaker's sliding window and must not be
+  blocked when the breaker is `OPEN`. Outage behaviour: `OPEN` + hit => a real answer; `OPEN` + miss =>
+  the Day 8 escalation. Because `CachedResolutionService` is a separate injected bean, the call to the
+  resolver still crosses the AOP proxy, so Day 8's retry/breaker stay live on a miss.
+- **The key is a full-request identity hash** (`CacheKeyFactory`, ADR-019): a SHA-256 over every
+  answer-affecting input — resolver model id, the static system prompt, the trimmed ticket text,
+  temperature, and `maxTokens` — joined in one canonical serialization. Change any of them and the key
+  changes automatically (invalidation by construction); a readable `v1` version prefix is the manual
+  bulk-invalidation lever. Hashing (vs. raw text) bounds key size **and** keeps customer PII out of the
+  Redis keyspace, since keys leak into logs and `SCAN` output.
+- **Fail-open (ADR-018).** `ResolutionCache` wraps every Redis op in a broad `try/catch`: a read
+  failure — connection refused, timeout, corrupt JSON — degrades to a **miss**, and a write failure is
+  a no-op. A cost optimisation must never become an availability dependency, so one broad catch mapping
+  every failure to "behave as if uncached" is the honest design, not laziness.
+- **Escalation fallbacks are never cached.** An ADR-014 `ESCALATED_TO_HUMAN` result is an *availability*
+  answer, not a *knowledge* answer; caching it would keep escalating tickets for the full TTL after
+  Anthropic recovers. Entries carry a 24h TTL (`aura.cache.ttl`, bound to a `Duration`).
+
+### Layer 2 — Anthropic prompt-prefix cache (ADR-020)
+
+The resolver request marks the static system prompt (rules + few-shot — the stable prefix) with an
+ephemeral `cache_control` breakpoint, and the volatile ticket goes *after* it in `messages`. On a
+hit, Anthropic serves that prefix ~90% cheaper; the breakpoint sits on the **last byte-identical
+block**, because anything volatile at or before it would pay a cache write every call and never read.
+The static prompt was expanded so the prefix clears Sonnet's ~1,024-token minimum (below it, caching
+is a silent no-op). Each resolution logs `cacheCreationInputTokens` / `cacheReadInputTokens` for
+observability. The classifier deliberately carries **no** breakpoint — Haiku's minimum cacheable
+prefix is 4,096 tokens and this prompt is far below it, so a marker would imply a saving that
+doesn't exist.
+
+### Why the two layers never overlap
+
+An identical ticket short-circuits at Redis and never reaches Anthropic, so a **prefix-cache read is
+only observable on a *different* ticket** (Redis miss, warm Anthropic prefix). First call to a new
+ticket: Redis miss + prefix write. Repeat: Redis hit, no model call at all. Different ticket: Redis
+miss, but the prefix is read cheaply. The blocking `/resolve` path runs through Layer 1; the SSE
+streaming path benefits from Layer 2 only (response caching for streams is a parking-lot item).
+
+### Timeout tuning — fail-open without a time bound is fail-slow
+
+Fail-open protects *correctness*, but Lettuce's default command timeout is **60 seconds**, so a
+Redis that dies while the app holds a pooled connection makes each cache op (get + put) block for a
+minute — turning a down cache into ~120s of added latency per request. Bounding both timeouts to
+`250ms` collapses that to sub-second degradation:
+
+```yaml
+spring:
+  data:
+    redis:
+      timeout: 250ms          # command reply wait — was the 60s default that caused the hang
+      connect-timeout: 250ms  # TCP establishment — covers silent SYN drops
+```
+
+(250ms suits a localhost Redis; loosen it for networked Redis so a normal blip doesn't cause spurious
+misses.)
+
+### Run
+
+Start Redis, then the app (the cache is fail-open, so the app also runs without Redis — just uncached):
+
+```bash
+docker compose up -d redis
+./mvnw spring-boot:run
+```
