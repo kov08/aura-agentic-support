@@ -183,3 +183,93 @@ Run (same as Day 1):
 ```bash
 ./mvnw spring-boot:run
 ```
+
+## Day 7 — Streaming Resolution (Server-Sent Events)
+
+**What was added:** a streaming twin of the resolve endpoint that pushes the answer to the client
+token-by-token over Server-Sent Events, so a user sees words appear instead of waiting for the whole
+Sonnet generation. The perceived-latency win is the entire point — the grounding and prompt are
+identical to the blocking path; only the transport differs.
+
+`TicketStreamingService` (`org.aura.aura.streaming`) returns an `SseEmitter` immediately and does the
+real work on a dedicated executor (`StreamingAsyncConfig`), so the servlet thread is never blocked.
+The pump reuses the exact retrieve-augment step as `ResolverService` (via `buildStreamingParams`) and
+opens `client.messages().createStreaming(...)` inside a try-with-resources — `close()` cancels the
+upstream generation on **any** exit, which is what stops paying for tokens the client will never read.
+
+Every frame is a **named JSON event** so a client dispatches on the event name and parses one body
+shape throughout (`org.aura.aura.streaming` DTOs):
+
+- `classification` — emitted first, so a client can route/label the ticket before the answer begins.
+- `delta` — one text chunk per `content_block_delta`; the same text is accumulated server-side.
+- `done` — the terminal success frame: `stop_reason` (with `max_tokens` surfaced as *truncation data*,
+  not an error), input/output token usage, and server-side elapsed ms.
+- `error` — a single RFC 9457-shaped frame on an upstream failure.
+
+The pump has **three exit paths**, each of which must complete the emitter or the connection hangs
+until timeout: a clean end (`done`), a client disconnect (`send()` throws `IOException` → stop pumping,
+let try-with-resources cancel upstream, complete quietly — no one is left to read an error), and an
+upstream/API failure (deliver one `error` frame, then complete; deliberately **no retry**, since part
+of the answer may already be on the wire and replaying would duplicate text). `@Valid` still runs on
+the servlet thread *before* the emitter exists, so a bad request is a normal `400`
+`application/problem+json`, never a half-opened stream.
+
+### Stream a resolution
+`POST /api/v1/tickets/{ticketId}/resolve/stream` → `text/event-stream`
+
+```
+event: classification
+data: { "category": "RETURNS_AND_REFUNDS", "urgency": "LOW", ... }
+
+event: delta
+data: { "text": "ShopFast accepts returns " }
+
+event: done
+data: { "stopReason": "end_turn", "inputTokens": 62, "outputTokens": 141, "elapsedMs": 1840 }
+```
+
+Run (same as Day 1):
+
+```bash
+./mvnw spring-boot:run
+```
+
+## Day 8 — Transport Resilience (Retry + Circuit Breaker)
+
+**What was added:** Resilience4j retry and a circuit breaker on the Anthropic dependency, so a
+transient blip is retried, a sustained outage fails fast, and either way the customer gets a
+business-valid answer instead of a `5xx`. The annotations `@Retry` / `@CircuitBreaker` sit on
+`ResolverService.resolve(...)` — a public method reached across a bean boundary, which is mandatory:
+Spring implements them with an AOP proxy, so a self-invocation would silently disable both policies.
+Both bind to one instance name, `anthropicApi` — one dependency, two policies — and the config in
+`application.yml` reads as two views of the same thing.
+
+- **Retry** uses an **allowlist** of transient SDK exceptions (`RateLimitException` 429,
+  `InternalServerException` 5xx, `AnthropicIoException` connection/timeout). Anything not listed — a
+  permanent `400/401/403/404`, or any unknown/future type — is **not** retried. That "unknown ⇒ don't
+  retry" default *fails closed*: a denylist would fail open and eventually double-fire a future
+  non-idempotent operation (the refund tool). Three total attempts, exponential backoff + jitter.
+- **The SDK's own retries are disabled** (`maxRetries(0)`, ADR-012) so the app owns the single retry
+  policy — otherwise SDK×app retries would multiply (3×3 = 9 calls per request, ADR-013).
+- **Circuit breaker** records the *same* transient taxonomy (a permanent `400` is our bug, not Claude
+  being down, so it must not trip the breaker). Count-based window of 10, opens at a 50% failure rate
+  once it has seen ≥5 calls, stays open 30s.
+- **Fallback = graceful degradation, not masking.** `escalateToHuman` fires on exactly two "Claude is
+  unhealthy" paths — breaker `OPEN` (`CallNotPermittedException`) or a transient failure whose retries
+  were exhausted — and returns a real `Resolution` with status `ESCALATED_TO_HUMAN` (HTTP `200`, a
+  human is a better outcome than an error page). Everything else is **re-propagated**. The
+  `fallbackMethod` sits on the outer `@Retry`, not the inner `@CircuitBreaker`, so it can't short-circuit
+  retries before they run.
+
+`Resolution` gained a `status` field (`RESOLVED` vs `ESCALATED_TO_HUMAN`) so a caller can tell a
+degraded answer from a normal one. The classifier shares the same breaker (fast-fail during an outage)
+but takes **no retry** — it is a cheap pre-gate whose failure already has a safe fallback, so a second
+call would only add latency. `ResolverResilienceTest` proves the policy against a **real AOP-proxied
+bean** (retry-then-succeed, no-retry-on-`400`, escalate-on-exhausted, escalate-on-breaker-open); a
+plain `new ResolverService(...)` would exercise no resilience at all.
+
+Run (same as Day 1):
+
+```bash
+./mvnw spring-boot:run
+```
