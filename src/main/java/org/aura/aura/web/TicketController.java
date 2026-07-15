@@ -2,8 +2,8 @@ package org.aura.aura.web;
 
 import org.aura.aura.classification.ClassificationResult;
 import org.aura.aura.classification.TicketClassificationService;
+import org.aura.aura.resolver.CachedResolutionService;
 import org.aura.aura.resolver.Resolution;
-import org.aura.aura.resolver.ResolverService;
 import org.aura.aura.streaming.TicketStreamingService;
 import org.aura.aura.web.dto.ClassificationResponse;
 import org.aura.aura.web.dto.ClassifyTicketRequest;
@@ -20,14 +20,17 @@ import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 @RequestMapping("/api/v1/tickets")  // path-based versioning: version visible in URL & tool-friendly
 class TicketController {
 
-    private final ResolverService resolverService; // constructor injection -> final, testable
+    // Day 9: the blocking /resolve path goes through the cache-aside bean (ADR-018), not
+    // ResolverService directly — a hit skips the paid Sonnet call entirely. The streaming path
+    // still uses ResolverService (response caching is a parking-lot item for SSE).
+    private final CachedResolutionService cachedResolutionService; // constructor injection -> final, testable
     private final TicketClassificationService classificationService;
     private final TicketStreamingService streamingService;
 
-    TicketController(ResolverService resolverService,
+    TicketController(CachedResolutionService cachedResolutionService,
                      TicketClassificationService classificationService,
                      TicketStreamingService streamingService) {
-        this.resolverService = resolverService;
+        this.cachedResolutionService = cachedResolutionService;
         this.classificationService = classificationService;
         this.streamingService = streamingService;
     }
@@ -43,7 +46,7 @@ class TicketController {
         // prioritize, or short-circuit before paying for the expensive call. Today the
         // result only rides along in the response — the wiring point already exists.
         ClassificationResult classification = classificationService.classify(request.message());
-        Resolution resolution = resolverService.resolve(request.message());
+        Resolution resolution = cachedResolutionService.resolve(request);
         return ResolutionResponse.from(ticketId, resolution, ClassificationResponse.from(classification));
     }
 

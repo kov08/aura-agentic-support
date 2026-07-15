@@ -71,6 +71,8 @@ public class TicketStreamingService {
         long startNanos = System.nanoTime();
         StringBuilder fullText = new StringBuilder(); // accumulated server-side: logging now, Redis persistence Day 9
         long inputTokens = 0L;
+        long cacheCreationInputTokens = 0L;  // ADR-020: prompt-cache observability, same fields as the blocking path
+        long cacheReadInputTokens = 0L;
         long outputTokens = 0L;
         String stopReason = null;
 
@@ -96,8 +98,14 @@ public class TicketStreamingService {
                     RawMessageStreamEvent event = events.next();
 
                     // message_start carries input-token usage — capture it, nothing to emit yet.
+                    // ADR-020: the same message_start usage block also carries the prompt-cache
+                    // figures; cacheReadInputTokens > 0 here means the static system-prefix hit
+                    // Anthropic's ephemeral cache. Optionals -> orElse(0L) on an uncached call.
                     if (event.messageStart().isPresent()) {
-                        inputTokens = event.messageStart().get().message().usage().inputTokens();
+                        var usage = event.messageStart().get().message().usage();
+                        inputTokens = usage.inputTokens();
+                        cacheCreationInputTokens = usage.cacheCreationInputTokens().orElse(0L);
+                        cacheReadInputTokens = usage.cacheReadInputTokens().orElse(0L);
                     }
 
                     // content_block_delta with a text delta -> one "delta" frame. Accumulate the
@@ -124,9 +132,13 @@ public class TicketStreamingService {
             // (d) Clean end. stop_reason==max_tokens arrives here as truncation DATA, not an error —
             //     the answer we streamed is valid, just possibly cut short; the client decides.
             long elapsedMs = (System.nanoTime() - startNanos) / 1_000_000L;
+            // DoneEvent stays the client wire contract (stop_reason + billing tokens + latency); the
+            // cache figures are OPERATIONAL data and stay in the log line only, never leaking onto the
+            // SSE frame — same "ops data doesn't hit the wire" discipline as ResolutionResponse.
             emitter.send(sse(SseEvents.DONE, new DoneEvent(stopReason, inputTokens, outputTokens, elapsedMs)));
-            log.info("SSE [{}] done — stop_reason={}, in={}, out={}, elapsedMs={}, chars={}",
-                    ticketId, stopReason, inputTokens, outputTokens, elapsedMs, fullText.length());
+            log.info("SSE [{}] done — stop_reason={}, in={}, out={}, cacheCreate={}, cacheRead={}, elapsedMs={}, chars={}",
+                    ticketId, stopReason, inputTokens, outputTokens,
+                    cacheCreationInputTokens, cacheReadInputTokens, elapsedMs, fullText.length());
             emitter.complete();
 
         } catch (IOException disconnected) {

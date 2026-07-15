@@ -56,6 +56,15 @@
             <version>2.40.1</version>
         </dependency>
 
+        <!-- Day 9: Redis response cache (ADR-018). Auto-configures a StringRedisTemplate against
+             spring.data.redis.* — no @Configuration/@Bean needed; ResolutionCache injects that
+             template directly. Lettuce is the default client. Version managed by the
+             spring-boot-starter-parent BOM. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-redis</artifactId>
+        </dependency>
+
         <!-- Resilience4j Spring Boot integration: brings the @Retry/@CircuitBreaker/
              @RateLimiter annotations plus the application.yml config binding
              (resilience4j.retry.instances.*, resilience4j.circuitbreaker.instances.*, ...).

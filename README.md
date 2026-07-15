@@ -183,3 +183,170 @@ Run (same as Day 1):
 ```bash
 ./mvnw spring-boot:run
 ```
+
+## Day 7 — Streaming Resolution (Server-Sent Events)
+
+**What was added:** a streaming twin of the resolve endpoint that pushes the answer to the client
+token-by-token over Server-Sent Events, so a user sees words appear instead of waiting for the whole
+Sonnet generation. The perceived-latency win is the entire point — the grounding and prompt are
+identical to the blocking path; only the transport differs.
+
+`TicketStreamingService` (`org.aura.aura.streaming`) returns an `SseEmitter` immediately and does the
+real work on a dedicated executor (`StreamingAsyncConfig`), so the servlet thread is never blocked.
+The pump reuses the exact retrieve-augment step as `ResolverService` (via `buildStreamingParams`) and
+opens `client.messages().createStreaming(...)` inside a try-with-resources — `close()` cancels the
+upstream generation on **any** exit, which is what stops paying for tokens the client will never read.
+
+Every frame is a **named JSON event** so a client dispatches on the event name and parses one body
+shape throughout (`org.aura.aura.streaming` DTOs):
+
+- `classification` — emitted first, so a client can route/label the ticket before the answer begins.
+- `delta` — one text chunk per `content_block_delta`; the same text is accumulated server-side.
+- `done` — the terminal success frame: `stop_reason` (with `max_tokens` surfaced as *truncation data*,
+  not an error), input/output token usage, and server-side elapsed ms.
+- `error` — a single RFC 9457-shaped frame on an upstream failure.
+
+The pump has **three exit paths**, each of which must complete the emitter or the connection hangs
+until timeout: a clean end (`done`), a client disconnect (`send()` throws `IOException` → stop pumping,
+let try-with-resources cancel upstream, complete quietly — no one is left to read an error), and an
+upstream/API failure (deliver one `error` frame, then complete; deliberately **no retry**, since part
+of the answer may already be on the wire and replaying would duplicate text). `@Valid` still runs on
+the servlet thread *before* the emitter exists, so a bad request is a normal `400`
+`application/problem+json`, never a half-opened stream.
+
+### Stream a resolution
+`POST /api/v1/tickets/{ticketId}/resolve/stream` → `text/event-stream`
+
+```
+event: classification
+data: { "category": "RETURNS_AND_REFUNDS", "urgency": "LOW", ... }
+
+event: delta
+data: { "text": "ShopFast accepts returns " }
+
+event: done
+data: { "stopReason": "end_turn", "inputTokens": 62, "outputTokens": 141, "elapsedMs": 1840 }
+```
+
+Run (same as Day 1):
+
+```bash
+./mvnw spring-boot:run
+```
+
+## Day 8 — Transport Resilience (Retry + Circuit Breaker)
+
+**What was added:** Resilience4j retry and a circuit breaker on the Anthropic dependency, so a
+transient blip is retried, a sustained outage fails fast, and either way the customer gets a
+business-valid answer instead of a `5xx`. The annotations `@Retry` / `@CircuitBreaker` sit on
+`ResolverService.resolve(...)` — a public method reached across a bean boundary, which is mandatory:
+Spring implements them with an AOP proxy, so a self-invocation would silently disable both policies.
+Both bind to one instance name, `anthropicApi` — one dependency, two policies — and the config in
+`application.yml` reads as two views of the same thing.
+
+- **Retry** uses an **allowlist** of transient SDK exceptions (`RateLimitException` 429,
+  `InternalServerException` 5xx, `AnthropicIoException` connection/timeout). Anything not listed — a
+  permanent `400/401/403/404`, or any unknown/future type — is **not** retried. That "unknown ⇒ don't
+  retry" default *fails closed*: a denylist would fail open and eventually double-fire a future
+  non-idempotent operation (the refund tool). Three total attempts, exponential backoff + jitter.
+- **The SDK's own retries are disabled** (`maxRetries(0)`, ADR-012) so the app owns the single retry
+  policy — otherwise SDK×app retries would multiply (3×3 = 9 calls per request, ADR-013).
+- **Circuit breaker** records the *same* transient taxonomy (a permanent `400` is our bug, not Claude
+  being down, so it must not trip the breaker). Count-based window of 10, opens at a 50% failure rate
+  once it has seen ≥5 calls, stays open 30s.
+- **Fallback = graceful degradation, not masking.** `escalateToHuman` fires on exactly two "Claude is
+  unhealthy" paths — breaker `OPEN` (`CallNotPermittedException`) or a transient failure whose retries
+  were exhausted — and returns a real `Resolution` with status `ESCALATED_TO_HUMAN` (HTTP `200`, a
+  human is a better outcome than an error page). Everything else is **re-propagated**. The
+  `fallbackMethod` sits on the outer `@Retry`, not the inner `@CircuitBreaker`, so it can't short-circuit
+  retries before they run.
+
+`Resolution` gained a `status` field (`RESOLVED` vs `ESCALATED_TO_HUMAN`) so a caller can tell a
+degraded answer from a normal one. The classifier shares the same breaker (fast-fail during an outage)
+but takes **no retry** — it is a cheap pre-gate whose failure already has a safe fallback, so a second
+call would only add latency. `ResolverResilienceTest` proves the policy against a **real AOP-proxied
+bean** (retry-then-succeed, no-retry-on-`400`, escalate-on-exhausted, escalate-on-breaker-open); a
+plain `new ResolverService(...)` would exercise no resilience at all.
+
+Run (same as Day 1):
+
+```bash
+./mvnw spring-boot:run
+```
+## Day 9 — Two-Layer Caching (Redis response cache + Anthropic prompt-prefix cache)
+
+**What was added:** two independent caches that attack cost from opposite ends, plus the timeout
+tuning that keeps the first one from becoming an availability dependency. The key insight is that the
+two layers operate on **different denominators** and can never both fire on the same request.
+
+### Layer 1 — Redis response cache (explicit cache-aside, ADR-018)
+
+`CachedResolutionService` wraps the resolver: it builds a key, checks Redis, and only on a miss calls
+`ResolverService.resolve(...)`. A hit skips the paid Sonnet call entirely. Deliberately hand-rolled
+cache-aside — no `@Cacheable`/`spring-cache` — so the ordering and fail behaviour are explicit.
+
+- **The cache is checked *before* the resilience stack, and that ordering is the design.** A hit is
+  not a call to Anthropic, so it must not occupy a slot in the breaker's sliding window and must not be
+  blocked when the breaker is `OPEN`. Outage behaviour: `OPEN` + hit => a real answer; `OPEN` + miss =>
+  the Day 8 escalation. Because `CachedResolutionService` is a separate injected bean, the call to the
+  resolver still crosses the AOP proxy, so Day 8's retry/breaker stay live on a miss.
+- **The key is a full-request identity hash** (`CacheKeyFactory`, ADR-019): a SHA-256 over every
+  answer-affecting input — resolver model id, the static system prompt, the trimmed ticket text,
+  temperature, and `maxTokens` — joined in one canonical serialization. Change any of them and the key
+  changes automatically (invalidation by construction); a readable `v1` version prefix is the manual
+  bulk-invalidation lever. Hashing (vs. raw text) bounds key size **and** keeps customer PII out of the
+  Redis keyspace, since keys leak into logs and `SCAN` output.
+- **Fail-open (ADR-018).** `ResolutionCache` wraps every Redis op in a broad `try/catch`: a read
+  failure — connection refused, timeout, corrupt JSON — degrades to a **miss**, and a write failure is
+  a no-op. A cost optimisation must never become an availability dependency, so one broad catch mapping
+  every failure to "behave as if uncached" is the honest design, not laziness.
+- **Escalation fallbacks are never cached.** An ADR-014 `ESCALATED_TO_HUMAN` result is an *availability*
+  answer, not a *knowledge* answer; caching it would keep escalating tickets for the full TTL after
+  Anthropic recovers. Entries carry a 24h TTL (`aura.cache.ttl`, bound to a `Duration`).
+
+### Layer 2 — Anthropic prompt-prefix cache (ADR-020)
+
+The resolver request marks the static system prompt (rules + few-shot — the stable prefix) with an
+ephemeral `cache_control` breakpoint, and the volatile ticket goes *after* it in `messages`. On a
+hit, Anthropic serves that prefix ~90% cheaper; the breakpoint sits on the **last byte-identical
+block**, because anything volatile at or before it would pay a cache write every call and never read.
+The static prompt was expanded so the prefix clears Sonnet's ~1,024-token minimum (below it, caching
+is a silent no-op). Each resolution logs `cacheCreationInputTokens` / `cacheReadInputTokens` for
+observability. The classifier deliberately carries **no** breakpoint — Haiku's minimum cacheable
+prefix is 4,096 tokens and this prompt is far below it, so a marker would imply a saving that
+doesn't exist.
+
+### Why the two layers never overlap
+
+An identical ticket short-circuits at Redis and never reaches Anthropic, so a **prefix-cache read is
+only observable on a *different* ticket** (Redis miss, warm Anthropic prefix). First call to a new
+ticket: Redis miss + prefix write. Repeat: Redis hit, no model call at all. Different ticket: Redis
+miss, but the prefix is read cheaply. The blocking `/resolve` path runs through Layer 1; the SSE
+streaming path benefits from Layer 2 only (response caching for streams is a parking-lot item).
+
+### Timeout tuning — fail-open without a time bound is fail-slow
+
+Fail-open protects *correctness*, but Lettuce's default command timeout is **60 seconds**, so a
+Redis that dies while the app holds a pooled connection makes each cache op (get + put) block for a
+minute — turning a down cache into ~120s of added latency per request. Bounding both timeouts to
+`250ms` collapses that to sub-second degradation:
+
+```yaml
+spring:
+  data:
+    redis:
+      timeout: 250ms          # command reply wait — was the 60s default that caused the hang
+      connect-timeout: 250ms  # TCP establishment — covers silent SYN drops
+```
+
+(250ms suits a localhost Redis; loosen it for networked Redis so a normal blip doesn't cause spurious
+misses.)
+
+### Run
+
+Start Redis, then the app (the cache is fail-open, so the app also runs without Redis — just uncached):
+
+```bash
+docker compose up -d redis
+./mvnw spring-boot:run
+```
