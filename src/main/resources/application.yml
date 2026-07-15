@@ -9,6 +9,8 @@ spring:
     redis:
       host: localhost
       port: 6379
+      connect-timeout: 250ms   # bounds TCP establishment (covers silent SYN drops)
+      timeout: 250ms           # bounds each command's wait for a reply — THIS was the 60s default
 
 # Response-cache tuning. Kept OUT of spring.* on purpose: this is AURA's own policy, not a
 # framework setting.
