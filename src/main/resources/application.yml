@@ -1,6 +1,20 @@
 spring:
   application:
     name: aura
+  # Day 9 (ADR-018): the spring-boot-starter-data-redis starter auto-configures a
+  # StringRedisTemplate against these two properties alone — no @Configuration class. That
+  # template is injected in ResolutionCache. Redis is a fail-open cost layer, so a wrong/unreachable
+  # host degrades every lookup to a MISS rather than erroring (see ResolutionCache.get).
+  data:
+    redis:
+      host: localhost
+      port: 6379
+
+# Response-cache tuning. Kept OUT of spring.* on purpose: this is AURA's own policy, not a
+# framework setting.
+aura:
+  cache:
+    ttl: 24h   # Spring binds "24h" to java.time.Duration — TTL is config, not a magic number
 
 # --- Resilience4j: one dependency (Claude / the Anthropic API), two policies -------------------
 # Both instances are named "anthropicApi" on purpose: the retry and the breaker are two policies on

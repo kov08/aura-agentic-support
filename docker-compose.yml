@@ -1,0 +1,17 @@
+# Local infrastructure for AURA. Day 9 adds Redis as the response-cache backing store
+# (ADR-018). It is a COST/AVAILABILITY layer, never a source of truth — the app fails open
+# when it is down (see ResolutionCache), so this compose file is a dev convenience, not a
+# hard runtime dependency.
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"   # maps to spring.data.redis.{host,port} in application.yml
+    healthcheck:
+      # `redis-cli ping` returns PONG once the server is accepting commands. Compose marks the
+      # container healthy only after this passes, so `depends_on: condition: service_healthy`
+      # (a future app service) can wait for a ready Redis rather than a merely-started one.
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
