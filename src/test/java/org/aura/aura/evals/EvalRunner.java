@@ -169,6 +169,18 @@ class EvalRunner {
         long escalateTrueLabels = scorable.stream().filter(g -> g.ticket().expected().escalate()).count();
         long escalateFloorHits = Math.max(escalateTrueLabels, scorable.size() - escalateTrueLabels);
 
+        // Reply-text rules are a resolver-stage dimension: how many rule-carrying tickets had a
+        // mustContain miss or a mustNot violation (over resolver-graded tickets only).
+        List<Graded> resolverGraded = graded.stream().filter(g -> !g.score().resolverDegraded()).toList();
+        int replyRuleTickets = (int) resolverGraded.stream()
+                .filter(g -> !g.ticket().expected().mustContain().isEmpty()
+                        || !g.ticket().expected().mustNotContain().isEmpty())
+                .count();
+        int mustContainFail = (int) resolverGraded.stream()
+                .filter(g -> !g.score().mustContainMisses().isEmpty()).count();
+        int mustNotFail = (int) resolverGraded.stream()
+                .filter(g -> !g.score().mustNotViolations().isEmpty()).count();
+
         Map<String, Accuracy> perCategory = new LinkedHashMap<>();
         scorable.stream().map(g -> g.ticket().expected().category().name()).distinct().sorted()
                 .forEach(cat -> perCategory.put(cat, passRate(scorable,
@@ -185,6 +197,7 @@ class EvalRunner {
                 errored.size(), rejected.size(),
                 category, urgency, intent, escalate, sources,
                 new Accuracy((int) escalateFloorHits, scorable.size()),
+                replyRuleTickets, mustContainFail, mustNotFail,
                 perCategory, perSlice);
     }
 
@@ -207,7 +220,7 @@ class EvalRunner {
         StringBuilder b = new StringBuilder();
         String rule = "=".repeat(78);
         b.append(rule).append("\n");
-        b.append("AURA GOLDEN-SET EVAL — baseline report\n");
+        b.append("AURA GOLDEN-SET EVAL — run report\n");
         b.append(rule).append("\n");
         b.append(String.format("resolverPromptVersion=%d  classifierPromptVersion=%d  goldenSetVersion=%d%n",
                 resolverPrompts.promptVersion(), classifierPrompts.promptVersion(), loadGoldenVersion()));
@@ -221,13 +234,20 @@ class EvalRunner {
         b.append("  REJECTED = the API refused our INPUT (HTTP 400) — the input-contract probe firing.\n");
         b.append("  DOWNSTREAM_OF_MISCLASSIFICATION = structurally zero — stages independent (TicketController:48).\n\n");
 
-        b.append("PER-FIELD ACCURACY (structured fields, strict match)\n");
+        // Reported per STAGE (amendment 7): the two services are graded independently, so their
+        // accuracy is presented independently. category/urgency/intent come from the classifier (Haiku);
+        // escalate/sources/reply-rules come from the resolver (Sonnet).
+        b.append("CLASSIFIER STAGE (Haiku) — structured-field accuracy, strict exact match\n");
         b.append(String.format("  category : %s%n", agg.category()));
         b.append(String.format("  urgency  : %s%n", agg.urgency()));
         b.append(String.format("  intent   : %s%n", agg.intent()));
+        b.append("\n");
+        b.append("RESOLVER STAGE (Sonnet)\n");
         b.append(String.format("  escalate : %s   [majority-class floor: %s — judge against THIS, not zero]%n",
                 agg.escalate(), agg.escalateFloor()));
         b.append(String.format("  sources  : %s   (graded tickets only; null labels excluded)%n", agg.sources()));
+        b.append(String.format("  reply    : %d rule-carrying ticket(s); %d with a mustContain miss, %d with a mustNot violation%n",
+                agg.replyRuleTickets(), agg.replyMustContainFail(), agg.replyMustNotFail()));
         b.append("\n");
 
         b.append("PER-CATEGORY pass rate (by label category)\n");
@@ -339,10 +359,20 @@ class EvalRunner {
         root.put("goldenSetVersion", loadGoldenVersion());
         root.put("timestamp", LocalDateTime.now().toString());
         root.put("counts", counts(agg));
-        root.put("perFieldAccuracy", Map.of(
-                "category", agg.category().toRatio(), "urgency", agg.urgency().toRatio(),
-                "intent", agg.intent().toRatio(), "escalate", agg.escalate().toRatio(),
-                "escalateMajorityClassFloor", agg.escalateFloor().toRatio(), "sources", agg.sources().toRatio()));
+        Map<String, Object> classifierStage = new LinkedHashMap<>();
+        classifierStage.put("category", agg.category().toRatio());
+        classifierStage.put("urgency", agg.urgency().toRatio());
+        classifierStage.put("intent", agg.intent().toRatio());
+        root.put("classifierStage", classifierStage);
+
+        Map<String, Object> resolverStage = new LinkedHashMap<>();
+        resolverStage.put("escalate", agg.escalate().toRatio());
+        resolverStage.put("escalateMajorityClassFloor", agg.escalateFloor().toRatio());
+        resolverStage.put("sources", agg.sources().toRatio());
+        resolverStage.put("replyRuleTickets", agg.replyRuleTickets());
+        resolverStage.put("replyMustContainFail", agg.replyMustContainFail());
+        resolverStage.put("replyMustNotFail", agg.replyMustNotFail());
+        root.put("resolverStage", resolverStage);
         root.put("perCategoryPassRate", ratios(agg.perCategory()));
         root.put("perSlicePassRate", ratios(agg.perSlice()));
         root.put("overallPassRate", new Accuracy(agg.passed(), agg.scored()).toRatio());
@@ -351,7 +381,11 @@ class EvalRunner {
         try {
             Path dir = Path.of("docs", "evals");
             Files.createDirectories(dir);
-            Path file = dir.resolve("baseline-" + stamp + ".json");
+            // Self-describing name: the version triple is IN the filename, so the docs/evals trail
+            // reads at a glance (cls1 = baseline classifier, cls2 = urgency-rubric experiment, ...)
+            // without opening each file. Not every run is a "baseline" — the prefix must not imply it.
+            Path file = dir.resolve(String.format("eval-cls%d-res%d-gs%d-%s.json",
+                    classifierPrompts.promptVersion(), resolverPrompts.promptVersion(), loadGoldenVersion(), stamp));
             Files.writeString(file, JSON.writeValueAsString(root), StandardCharsets.UTF_8);
             return file;
         } catch (IOException e) {
@@ -451,5 +485,6 @@ class EvalRunner {
             int classifierDegraded, int resolverDegraded, int fullyDegraded, int errored, int rejected,
             Accuracy category, Accuracy urgency, Accuracy intent, Accuracy escalate, Accuracy sources,
             Accuracy escalateFloor,
+            int replyRuleTickets, int replyMustContainFail, int replyMustNotFail,
             Map<String, Accuracy> perCategory, Map<String, Accuracy> perSlice) {}
 }
