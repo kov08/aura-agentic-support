@@ -61,10 +61,24 @@ class ResolutionCacheTest {
         assertThat(cache().get(KEY)).isEmpty();
     }
 
+    // Day 10: `escalate` must survive the JSON round-trip. A boolean absent from stored JSON
+    // deserializes to false silently, so a serialization gap here would turn every cached escalation
+    // into a non-escalation for the whole TTL — the worst possible failure, and an invisible one.
+    // (The Day 10 prompt-version bump orphans every pre-existing entry by construction, since
+    // CacheKeyFactory hashes the system prompt — but that protects only THIS migration, not the next.)
+    @Test
+    void escalateSurvivesTheCacheRoundTrip() {
+        Resolution escalating = new Resolution("a human will take this", List.of(), ResolutionStatus.RESOLVED, true);
+        when(redis.opsForValue()).thenReturn(valueOps);
+        when(valueOps.get(KEY)).thenReturn(objectMapper.writeValueAsString(escalating));
+
+        assertThat(cache().get(KEY)).contains(escalating);
+    }
+
     // A failed write is swallowed: the caller already has a full-price answer to return.
     @Test
     void redisWriteFailureDoesNotPropagate() {
-        Resolution value = new Resolution("answer", List.of("kb-returns"), ResolutionStatus.RESOLVED);
+        Resolution value = new Resolution("answer", List.of("kb-returns"), ResolutionStatus.RESOLVED, false);
         when(redis.opsForValue()).thenReturn(valueOps);
         doThrow(new RedisConnectionFailureException("redis down"))
                 .when(valueOps).set(anyString(), anyString(), any(Duration.class));
