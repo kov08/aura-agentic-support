@@ -78,6 +78,10 @@ class ClassificationResilienceTest {
         ClassificationResult result = classifier.classify("some ticket");
 
         assertThat(result.needsHumanReview()).isTrue();
+        // Day 10: the REASON is the load-bearing assertion now. This run produced no model answer at
+        // all, so the eval must exclude its labels as DEGRADED rather than score our fallback
+        // constants — and DEPENDENCY_UNAVAILABLE is the only signal that says so.
+        assertThat(result.reason()).isEqualTo(ReviewReason.DEPENDENCY_UNAVAILABLE);
         // No retry on classify: exactly one attempt (contrast with resolve, which retries transient).
         verify(client.messages(), times(1)).create(any(StructuredMessageCreateParams.class));
     }
@@ -104,6 +108,7 @@ class ClassificationResilienceTest {
         ClassificationResult result = classifier.classify("some ticket");
 
         assertThat(result.needsHumanReview()).isTrue();
+        assertThat(result.reason()).isEqualTo(ReviewReason.DEPENDENCY_UNAVAILABLE);
         verify(client.messages(), never()).create(any(StructuredMessageCreateParams.class));
     }
 
