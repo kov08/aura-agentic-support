@@ -9,6 +9,7 @@ import com.anthropic.models.messages.TextDelta;
 import lombok.extern.slf4j.Slf4j;
 import org.aura.aura.classification.ClassificationResult;
 import org.aura.aura.classification.TicketClassificationService;
+import org.aura.aura.resolver.ResolverOutput;
 import org.aura.aura.resolver.ResolverService;
 import org.aura.aura.web.dto.ClassificationResponse;
 import org.aura.aura.web.dto.ResolveTicketRequest;
@@ -16,6 +17,7 @@ import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.http.MediaType;
 import org.springframework.stereotype.Service;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
+import tools.jackson.databind.ObjectMapper;
 
 import java.io.IOException;
 import java.util.Iterator;
@@ -29,20 +31,28 @@ import java.util.concurrent.Executor;
 @Service
 public class TicketStreamingService {
 
+    // How much of a malformed envelope to put in the ERROR log. Bounded on purpose: enough to see
+    // where generation went wrong, not enough to dump an entire reply into the log file.
+    private static final int RAW_TAIL_CHARS = 200;
+
     private final AnthropicClient client;
     private final ResolverService resolverService;
     private final TicketClassificationService classificationService;
     private final Executor sseExecutor;
+    // Boot's configured mapper (same discipline as ResolutionCache) — never `new ObjectMapper()`.
+    private final ObjectMapper objectMapper;
 
     public TicketStreamingService(
             AnthropicClient client,
             ResolverService resolverService,
             TicketClassificationService classificationService,
-            @Qualifier(StreamingAsyncConfig.SSE_EXECUTOR) Executor sseExecutor) {
+            @Qualifier(StreamingAsyncConfig.SSE_EXECUTOR) Executor sseExecutor,
+            ObjectMapper objectMapper) {
         this.client = client;
         this.resolverService = resolverService;
         this.classificationService = classificationService;
         this.sseExecutor = sseExecutor;
+        this.objectMapper = objectMapper;
     }
 
     // Returns IMMEDIATELY with an open emitter; the actual work runs on sseExecutor. The controller
@@ -69,7 +79,14 @@ public class TicketStreamingService {
     // otherwise the connection (and its pump thread) hangs until the 120s timeout.
     private void pump(String ticketId, ResolveTicketRequest request, SseEmitter emitter) {
         long startNanos = System.nanoTime();
-        StringBuilder fullText = new StringBuilder(); // accumulated server-side: logging now, Redis persistence Day 9
+        // Day 10: what arrives on the wire is now the RAW structured-output envelope
+        // ({"reply":"...","escalate":...}), not customer prose. Two consumers, deliberately separate:
+        //   envelope  — accumulated verbatim, parsed ONCE at end-of-stream for schema validity + escalate.
+        //   extractor — unwraps the reply text incrementally so the customer still sees words appear
+        //               as they generate. Waiting for the envelope to complete before forwarding
+        //               anything would hand back the entire perceived-latency win Day 7 bought.
+        StringBuilder envelope = new StringBuilder();
+        StreamingReplyExtractor replyExtractor = new StreamingReplyExtractor();
         long inputTokens = 0L;
         long cacheCreationInputTokens = 0L;  // ADR-020: prompt-cache observability, same fields as the blocking path
         long cacheReadInputTokens = 0L;
@@ -108,13 +125,22 @@ public class TicketStreamingService {
                         cacheReadInputTokens = usage.cacheReadInputTokens().orElse(0L);
                     }
 
-                    // content_block_delta with a text delta -> one "delta" frame. Accumulate the
-                    // same text server-side for logging/persistence.
+                    // content_block_delta carries a fragment of the JSON envelope — NOT customer text.
+                    // Keep the raw fragment for the end-of-stream parse, but forward only what the
+                    // extractor unwraps; sending the raw piece here is what would paint
+                    // {"reply":"I'm sorry it's tak across the customer's screen.
                     Optional<TextDelta> textDelta = event.contentBlockDelta().flatMap(d -> d.delta().text());
                     if (textDelta.isPresent()) {
-                        String piece = textDelta.get().text();
-                        fullText.append(piece);
-                        emitter.send(sse(SseEvents.DELTA, new DeltaEvent(piece)));
+                        String rawPiece = textDelta.get().text();
+                        envelope.append(rawPiece);
+
+                        String customerPiece = replyExtractor.accept(rawPiece);
+                        // Skip empty results rather than emitting a zero-length frame: while the
+                        // envelope's scaffolding streams past, the extractor legitimately has nothing
+                        // to hand over, and a client shouldn't have to filter meaningless deltas.
+                        if (!customerPiece.isEmpty()) {
+                            emitter.send(sse(SseEvents.DELTA, new DeltaEvent(customerPiece)));
+                        }
                     }
 
                     // message_delta carries the final stop_reason and the cumulative output usage.
@@ -132,13 +158,23 @@ public class TicketStreamingService {
             // (d) Clean end. stop_reason==max_tokens arrives here as truncation DATA, not an error —
             //     the answer we streamed is valid, just possibly cut short; the client decides.
             long elapsedMs = (System.nanoTime() - startNanos) / 1_000_000L;
+
+            // (d1) Parse the completed envelope exactly once. This is the streaming twin of the
+            //      blocking path's stop_reason gate — the schema-validity check — and the ONLY place
+            //      this path can learn the escalate verdict, since the model emits that field after
+            //      the reply text and no mid-stream frame could have carried it.
+            Optional<ResolverOutput> output = parseEnvelope(ticketId, envelope.toString());
+            Boolean escalate = output.map(ResolverOutput::escalate).orElse(null);
+
             // DoneEvent stays the client wire contract (stop_reason + billing tokens + latency); the
             // cache figures are OPERATIONAL data and stay in the log line only, never leaking onto the
             // SSE frame — same "ops data doesn't hit the wire" discipline as ResolutionResponse.
+            // `escalate` joins that operational set deliberately: the SSE event protocol stays
+            // byte-identical to Day 7's, and Day 16 owns exposing escalation on the wire.
             emitter.send(sse(SseEvents.DONE, new DoneEvent(stopReason, inputTokens, outputTokens, elapsedMs)));
-            log.info("SSE [{}] done — stop_reason={}, in={}, out={}, cacheCreate={}, cacheRead={}, elapsedMs={}, chars={}",
-                    ticketId, stopReason, inputTokens, outputTokens,
-                    cacheCreationInputTokens, cacheReadInputTokens, elapsedMs, fullText.length());
+            log.info("SSE [{}] done — stop_reason={}, escalate={}, in={}, out={}, cacheCreate={}, cacheRead={}, elapsedMs={}, envelopeChars={}",
+                    ticketId, stopReason, escalate, inputTokens, outputTokens,
+                    cacheCreationInputTokens, cacheReadInputTokens, elapsedMs, envelope.length());
             emitter.complete();
 
         } catch (IOException disconnected) {
@@ -162,6 +198,31 @@ public class TicketStreamingService {
             }
             emitter.complete();
         }
+    }
+
+    // Deliberately NO invented recovery on a malformed envelope (Day 8's rule: retries happen only
+    // before the first byte). By the time this runs the customer has already received the reply text
+    // — it streamed as it was generated — so retrying would duplicate output and an error frame would
+    // contradict what they just watched appear. What a failure here actually means is that the model
+    // truncated or the transport corrupted the tail, which costs us the escalate verdict and nothing
+    // else. Log it loudly for diagnosis and terminate exactly as before.
+    //
+    // The tail is bounded and is OUR generated reply text, not the customer's ticket — the Day 9 PII
+    // rule (log the hash, never the ticket) is not weakened here.
+    private Optional<ResolverOutput> parseEnvelope(String ticketId, String envelope) {
+        try {
+            return Optional.of(objectMapper.readValue(envelope, ResolverOutput.class));
+        } catch (Exception malformed) {
+            log.error("SSE [{}] resolver envelope failed schema validation — escalate verdict lost. rawTail={}",
+                    ticketId, tail(envelope), malformed);
+            return Optional.empty();
+        }
+    }
+
+    private static String tail(String envelope) {
+        return envelope.length() <= RAW_TAIL_CHARS
+                ? envelope
+                : envelope.substring(envelope.length() - RAW_TAIL_CHARS);
     }
 
     // Every frame is named + JSON so a client dispatches on the event name and parses one body
