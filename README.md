@@ -350,3 +350,87 @@ Start Redis, then the app (the cache is fail-open, so the app also runs without 
 docker compose up -d redis
 ./mvnw spring-boot:run
 ```
+
+## Day 10 — Prompt Engineering II–III: Structured Escalation & a Golden-Set Eval Harness
+
+**What was added:** a measurement rig for AURA's judgment — a hand-labelled golden set, a pure scorer,
+and a runner that drives the real pipeline — plus the one production change that makes the agent's
+escalation decision *measurable*, and a first refinement experiment run against the harness.
+
+### The output change that made escalation gradeable
+
+Until now the resolver returned prose, and "should a human take this?" existed only as words inside the
+reply — impossible to assert on. `ResolverService` now uses the **same native structured outputs** as
+the Day 6 classifier: a two-field `ResolverOutput(reply, escalate)` schema, enforced server-side. The
+escalation verdict is data, not a phrase to grep for. Two escalation channels are kept deliberately
+distinct: `Resolution.status == ESCALATED_TO_HUMAN` is a *dependency-health* signal (the Day 8
+Resilience4j fallback, single writer), while `Resolution.escalate` is the *model's business judgment* —
+graded by the eval, cached like any knowledge answer. Because the schema is enforced, the SSE path now
+receives JSON on the wire; `StreamingReplyExtractor` (a pure chunk-by-chunk state machine) unwraps just
+the `reply` string so the customer still sees words stream in, tolerant of any network chunk split.
+
+### The harness
+
+- **`golden-set-v1.json`** — 24 tickets, hand-reviewed, across seven slices (`clean`, `ambiguous`,
+  `out_of_scope`, `injection`, `garbage`, `noisy`, `whiff`). Each carries strict structured labels
+  (category / urgency / intent / escalate) and, on the high-stakes third, sparse `mustContain` /
+  `mustNotContain` reply rules plus an `expectedSources` retrieval label. A canary token in the resolver
+  prompt lets the injection slice detect a system-prompt leak as a mechanical string check.
+- **`EvalScorer`** — a pure function (no Spring, no I/O), exhaustively unit-tested. Structured fields are
+  graded strictly (exact enum, boolean escalate); reply prose is graded *only* by the substring rules.
+  `expectedSources` is three-valued: `null` = ungraded, `[]` = strict "cite nothing", non-empty =
+  `expected ⊆ actual` with extra citations as warnings, not failures.
+- **`EvalRunner`** (`@Tag("eval")`) — drives the **inner** `ResolverService` and the classifier (never
+  the Redis cache wrapper) over all 24 tickets sequentially, in production order, and writes a
+  timestamped JSON + text report to `docs/evals/` stamped with the prompt-version triple. Outcomes are
+  bucketed distinctly: **DEGRADED** (a dependency-down Resilience4j fallback, excluded from scores),
+  **REJECTED** (the API refused the *input* with a 400 — the `garbage`-body probe firing, which is
+  exactly what production's `@NotBlank` blocks upstream), and **ERRORED** (an our-side output failure).
+  Only ERRORED hard-fails the run — score dips print, they never fail the build. That is the one
+  assertion: with the schema enforced server-side, an unusable output means the call threw, which lands
+  in ERRORED.
+- **`GoldenSetIntegrityTest`** — runs in the *normal* suite (deterministic, no network, no key). It is
+  the label-rot tripwire: a renamed enum or a dropped ticket breaks it loudly instead of silently
+  invalidating a label.
+
+Evals are not unit tests — unit tests assert logic, evals measure judgment — so Surefire keeps them
+apart:
+
+```bash
+./mvnw test            # fast, free, offline: unit + integrity + scorer tests only
+./mvnw test -Pevals    # the golden-set runner only (needs ANTHROPIC_API_KEY; makes ~48 live calls)
+```
+
+### The experiment: an explicit urgency rubric (classifier prompt v1 → v2)
+
+The baseline (`docs/evals/eval-cls1-*`) showed urgency was the weakest structured field — the model was
+guessing where LOW/MEDIUM/HIGH/CRITICAL boundaries sit. The single-variable refinement was to add an
+explicit `<urgency_rubric>` to the classifier prompt: written rules mapping observable facts to levels
+(money already lost → CRITICAL; a purchase or delivery blocked now → HIGH; degraded-but-workable →
+MEDIUM; preference or curiosity → LOW), take-the-higher on conflict. Nothing else changed — resolver
+prompt v3, temperature, and all other inputs were held fixed.
+
+| Classifier field | Baseline (v1) | Experiment (v2) |
+|---|---|---|
+| category | 19/23 (82.6%) | 17/23 (73.9%) |
+| **urgency** | **14/23 (60.9%)** | **18/23 (78.3%)** |
+| intent | 16/23 (69.6%) | 15/23 (65.2%) |
+
+Resolver stage (held constant) was steady: escalate 20→21/23 (vs a 65.2% majority-class floor), sources
+10/11, and every reply-safety rule clean (0 `mustNot` violations, canary never leaked).
+
+**Verdict: keep the rubric.** Urgency improved +4 tickets on exactly the boundary cases it targeted
+(order-overdue → HIGH, cancel-before-ship → HIGH, damaged item → HIGH, unauthorised change → CRITICAL,
+idle curiosity → LOW). Honest caveats, recorded so the next cycle starts clean: the run is a single
+sample at `temperature=1.0`, so the small category/intent wobble is noise-consistent for an urgency-only
+change rather than a real regression (e.g. a one-off `clean-05` category flip), and a confirmation run
+would tighten the estimate; the "take the higher" rule flipped `ambiguous-01` (wrong-size **and**
+double-charge) to CRITICAL/BILLING against its HIGH/RETURNS tie-break label — a label worth re-reviewing,
+alongside `clean-06` and `injection-02` where the rubric's answer looks more defensible than the
+original label. The full before/after trail lives in `docs/evals/`.
+
+Run (same as Day 1):
+
+```bash
+./mvnw spring-boot:run
+```
