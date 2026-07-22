@@ -5,8 +5,12 @@ import com.anthropic.core.JsonValue;
 import com.anthropic.core.http.Headers;
 import com.anthropic.errors.BadRequestException;
 import com.anthropic.errors.RateLimitException;
-import com.anthropic.models.messages.Message;
-import com.anthropic.models.messages.MessageCreateParams;
+import com.anthropic.models.messages.ContentBlock;
+import com.anthropic.models.messages.StopReason;
+import com.anthropic.models.messages.StructuredContentBlock;
+import com.anthropic.models.messages.StructuredMessage;
+import com.anthropic.models.messages.StructuredMessageCreateParams;
+import com.anthropic.models.messages.TextBlock;
 import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry;
 import org.aura.aura.ResolverPromptProvider;
 import org.junit.jupiter.api.BeforeEach;
@@ -20,6 +24,7 @@ import org.springframework.context.annotation.Import;
 import org.springframework.test.context.TestPropertySource;
 
 import java.util.List;
+import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -93,27 +98,27 @@ class ResolverResilienceTest {
     // returns the real answer. Two 429s then a success ⇒ exactly three network attempts.
     @Test
     void retriesOnRateLimitThenSucceeds() {
-        Message ok = mock(Message.class);
-        when(ok.content()).thenReturn(List.of());
-        when(client.messages().create(any(MessageCreateParams.class)))
+        when(client.messages().create(any(StructuredMessageCreateParams.class)))
                 .thenThrow(rateLimited())
                 .thenThrow(rateLimited())
-                .thenReturn(ok);
+                .thenReturn(okResponse());
 
         Resolution resolution = resolver.resolve(TICKET);
 
         // Succeeded on the third attempt: a normal, grounded RESOLVED answer — NOT an escalation.
         assertThat(resolution.status()).isEqualTo(ResolutionStatus.RESOLVED);
+        // BOTH channels agree it is a clean answer: healthy dependency, and no model-chosen handoff.
+        assertThat(resolution.escalate()).isFalse();
         assertThat(resolution.sourcesUsed()).containsExactly("kb-returns");
         // The retry actually re-called Claude: 1 original + 2 retries = 3 (max-attempts is a total).
-        verify(client.messages(), times(3)).create(any(MessageCreateParams.class));
+        verify(client.messages(), times(3)).create(any(StructuredMessageCreateParams.class));
     }
 
     // POLICY: a permanent error is NOT retried — it propagates. A 400 is our malformed request;
     // retrying it as-is only wastes calls. The absence-of-retry is the assertion: exactly one attempt.
     @Test
     void doesNotRetryOnBadRequest() {
-        when(client.messages().create(any(MessageCreateParams.class)))
+        when(client.messages().create(any(StructuredMessageCreateParams.class)))
                 .thenThrow(badRequest());
 
         // Propagates (does not get swallowed into a bogus escalation) — the fallback is typed to the
@@ -121,7 +126,7 @@ class ResolverResilienceTest {
         assertThatThrownBy(() -> resolver.resolve(TICKET))
                 .isInstanceOf(BadRequestException.class);
 
-        verify(client.messages(), times(1)).create(any(MessageCreateParams.class));
+        verify(client.messages(), times(1)).create(any(StructuredMessageCreateParams.class));
     }
 
     // POLICY: a transient failure that never clears within the attempt budget degrades to human
@@ -130,7 +135,7 @@ class ResolverResilienceTest {
     // permanent error is not on the transient allowlist, so it propagates instead of degrading.
     @Test
     void escalatesWhenRetriesExhausted() {
-        when(client.messages().create(any(MessageCreateParams.class)))
+        when(client.messages().create(any(StructuredMessageCreateParams.class)))
                 .thenThrow(rateLimited())
                 .thenThrow(rateLimited())
                 .thenThrow(rateLimited());
@@ -138,8 +143,11 @@ class ResolverResilienceTest {
         Resolution resolution = resolver.resolve(TICKET);
 
         assertThat(resolution.status()).isEqualTo(ResolutionStatus.ESCALATED_TO_HUMAN);
+        // The fallback sets BOTH channels: status says WHY (dependency unhealthy), escalate says WHAT
+        // to do now (route to a human), so a caller reading only escalate still behaves correctly.
+        assertThat(resolution.escalate()).isTrue();
         // Full retry budget spent (3 attempts) before degrading — not a silent single-shot give-up.
-        verify(client.messages(), times(3)).create(any(MessageCreateParams.class));
+        verify(client.messages(), times(3)).create(any(StructuredMessageCreateParams.class));
     }
 
     // POLICY: when the breaker is OPEN, resolve short-circuits to human escalation without touching
@@ -152,7 +160,23 @@ class ResolverResilienceTest {
         Resolution resolution = resolver.resolve(TICKET);
 
         assertThat(resolution.status()).isEqualTo(ResolutionStatus.ESCALATED_TO_HUMAN);
-        verify(client.messages(), never()).create(any(MessageCreateParams.class));
+        assertThat(resolution.escalate()).isTrue();
+        verify(client.messages(), never()).create(any(StructuredMessageCreateParams.class));
+    }
+
+    // A well-formed Day 10 envelope. The block is a real SDK object wrapping real JSON rather than a
+    // mock, so the typed deserialization the service depends on actually runs in these tests.
+    @SuppressWarnings("unchecked")
+    private static StructuredMessage<ResolverOutput> okResponse() {
+        StructuredMessage<ResolverOutput> message = mock(StructuredMessage.class);
+        when(message.stopReason()).thenReturn(Optional.of(StopReason.END_TURN));
+        TextBlock textBlock = TextBlock.builder()
+                .text("{\"reply\":\"Returns are accepted within 30 days.\",\"escalate\":false}")
+                .citations(List.of())
+                .build();
+        when(message.content()).thenReturn(List.of(
+                new StructuredContentBlock<>(ResolverOutput.class, ContentBlock.ofText(textBlock))));
+        return message;
     }
 
     // --- helpers: real SDK exception instances of the exact types the policy keys on ----------------

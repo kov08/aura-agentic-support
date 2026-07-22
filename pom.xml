@@ -146,7 +146,54 @@
                     </excludes>
                 </configuration>
             </plugin>
+
+            <!-- Day 10 (D1a): evals are NOT unit tests — they measure model judgment, hit the live
+                 Anthropic API, cost money, and their scores are allowed to dip without failing the
+                 build. So the default `mvn test` EXCLUDES the JUnit5 "eval" tag: it runs only the
+                 fast, free, offline unit + integrity + scorer tests. The `evals` profile below
+                 inverts this to run ONLY the eval group. -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <configuration>
+                    <excludedGroups>eval</excludedGroups>
+                </configuration>
+            </plugin>
         </plugins>
     </build>
+
+    <profiles>
+        <!-- `mvn test -Pevals` runs ONLY the eval group (the golden-set runner) and nothing else.
+             It needs a live ANTHROPIC_API_KEY.
+
+             combine.self="override" is load-bearing: without it Maven MERGES this configuration into
+             the base plugin config, so the base's <excludedGroups>eval</excludedGroups> survives
+             alongside this <groups>eval</groups> — and an excluded group beats an included one, so
+             Surefire selects zero tests (observed). "override" makes this block REPLACE the base
+             config outright, dropping the inherited exclusion. -->
+        <profile>
+            <id>evals</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-surefire-plugin</artifactId>
+                        <configuration combine.self="override">
+                            <groups>eval</groups>
+                            <!-- REQUIRED: Surefire only discovers classes matching its default name
+                                 patterns (*Test, *Tests, Test*, *TestCase). The runner is deliberately
+                                 named EvalRunner (it is a harness, not a unit test), which matches none
+                                 of them — so without this include, <groups>eval</groups> filters an
+                                 empty candidate set and 0 tests run (observed). This include makes
+                                 EvalRunner a candidate; the eval tag then selects it. -->
+                            <includes>
+                                <include>**/evals/EvalRunner.java</include>
+                            </includes>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
 
 </project>

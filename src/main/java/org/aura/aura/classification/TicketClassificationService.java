@@ -73,7 +73,8 @@ public class TicketClassificationService {
         // exceptions and lose the actual cause.
         Optional<StopReason> stopReason = response.stopReason();
         if (stopReason.isEmpty() || !StopReason.END_TURN.equals(stopReason.get())) {
-            return fallback("stop_reason=" + stopReason.map(StopReason::asString).orElse("<absent>"));
+            return fallback(reviewReasonFor(stopReason),
+                    "stop_reason=" + stopReason.map(StopReason::asString).orElse("<absent>"));
         }
 
         // .text() on the typed block deserializes straight into the record — the schema
@@ -83,10 +84,22 @@ public class TicketClassificationService {
                 .findFirst()
                 .map(StructuredTextBlock::text);
         if (parsed.isEmpty()) {
-            return fallback("end_turn response carried no text block");
+            return fallback(ReviewReason.MALFORMED_RESPONSE, "end_turn response carried no text block");
         }
 
         return validate(parsed.get());
+    }
+
+    // This one gate covers three genuinely different failures, so it maps to three different reasons
+    // rather than a single catch-all: a refusal is the model declining, a max_tokens cutoff is our own
+    // 256-token cost fuse blowing, and anything else is a response we don't understand. Collapsing
+    // them would rebuild inside this method the exact ambiguity ReviewReason exists to remove.
+    private static ReviewReason reviewReasonFor(Optional<StopReason> stopReason) {
+        if (stopReason.isEmpty()) return ReviewReason.MALFORMED_RESPONSE;
+        StopReason reason = stopReason.get();
+        if (StopReason.REFUSAL.equals(reason)) return ReviewReason.REFUSED;
+        if (StopReason.MAX_TOKENS.equals(reason)) return ReviewReason.TRUNCATED;
+        return ReviewReason.MALFORMED_RESPONSE;
     }
 
     // Semantic validation: the schema guarantees SHAPE (a number), not MEANING (a
@@ -95,12 +108,15 @@ public class TicketClassificationService {
     private ClassificationResult validate(TicketClassification raw) {
         double confidence = Math.clamp(raw.confidence(), 0.0, 1.0);
         if (confidence < CONFIDENCE_FLOOR) {
-            return fallback("confidence %.2f below floor %.2f".formatted(confidence, CONFIDENCE_FLOOR));
+            // NOT a degraded run: the model answered and was honest about being unsure. The eval
+            // scores these normally — calibration is a judgment worth measuring, not an outage.
+            return fallback(ReviewReason.LOW_CONFIDENCE,
+                    "confidence %.2f below floor %.2f".formatted(confidence, CONFIDENCE_FLOOR));
         }
         TicketClassification classification = confidence == raw.confidence()
                 ? raw
                 : new TicketClassification(raw.category(), raw.urgency(), raw.intent(), confidence);
-        return new ClassificationResult(classification, false);
+        return new ClassificationResult(classification, false, ReviewReason.NONE);
     }
 
     // Circuit-breaker fallback. classify() already OWNS a safe degraded answer — the human-review
@@ -122,7 +138,10 @@ public class TicketClassificationService {
                 || cause instanceof AnthropicIoException
                 || cause instanceof RateLimitException
                 || cause instanceof InternalServerException) {
-            return fallback("Claude unavailable (" + cause.getClass().getSimpleName() + ")");
+            // The ONLY site that produces DEPENDENCY_UNAVAILABLE — the one reason meaning "no model
+            // answer exists". Everything reaching here failed before Claude ever replied.
+            return fallback(ReviewReason.DEPENDENCY_UNAVAILABLE,
+                    "Claude unavailable (" + cause.getClass().getSimpleName() + ")");
         }
         throw cause;
     }
@@ -130,11 +149,18 @@ public class TicketClassificationService {
     // One fallback for every failure path: neutral labels, confidence 0.0 (we know
     // nothing), needsHumanReview=true. WARN not ERROR — the request still succeeds,
     // it just gets a human instead of automation.
-    private ClassificationResult fallback(String reason) {
-        log.warn("Ticket classification fell back to human review: {}", reason);
+    //
+    // `reason` is what each caller knows and used to throw away into the log string. The labels
+    // returned below are IDENTICAL on every path, so before Day 10 the four callers were
+    // indistinguishable to any consumer — the detail text existed only for a human reading logs.
+    // Passing the reason as data is what lets the eval exclude a genuine outage while still scoring
+    // an honest low-confidence answer (see ReviewReason).
+    private ClassificationResult fallback(ReviewReason reason, String detail) {
+        log.warn("Ticket classification fell back to human review: reason={} detail={}", reason, detail);
         return new ClassificationResult(
                 new TicketClassification(
                         TicketCategory.OTHER, TicketUrgency.MEDIUM, TicketIntent.GET_INFORMATION, 0.0),
-                true);
+                true,
+                reason);
     }
 }

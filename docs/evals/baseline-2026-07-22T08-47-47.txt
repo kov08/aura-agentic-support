@@ -1,0 +1,85 @@
+==============================================================================
+AURA GOLDEN-SET EVAL — baseline report
+==============================================================================
+resolverPromptVersion=3  classifierPromptVersion=1  goldenSetVersion=1
+timestamp=2026-07-22T08:47:47.780580600
+
+tickets: 24 total  |  23 scored  |  1 rejected  |  0 errored
+degraded (excluded from scores): classifier=0  resolver=0  fully=0
+  DEGRADED = a Resilience4j fallback (dependency down). ERRORED = our-side output failure.
+  REJECTED = the API refused our INPUT (HTTP 400) — the input-contract probe firing.
+  DOWNSTREAM_OF_MISCLASSIFICATION = structurally zero — stages independent (TicketController:48).
+
+PER-FIELD ACCURACY (structured fields, strict match)
+  category : 19/23 (82.6%)
+  urgency  : 14/23 (60.9%)
+  intent   : 16/23 (69.6%)
+  escalate : 20/23 (87.0%)   [majority-class floor: 15/23 (65.2%) — judge against THIS, not zero]
+  sources  : 10/11 (90.9%)   (graded tickets only; null labels excluded)
+
+PER-CATEGORY pass rate (by label category)
+  ACCOUNT                1/2 (50.0%)
+  BILLING                0/2 (0.0%)
+  ORDER_STATUS           1/3 (33.3%)
+  OTHER                  0/5 (0.0%)
+  PRODUCT_QUESTION       0/2 (0.0%)
+  RETURNS_AND_REFUNDS    3/6 (50.0%)
+  SHIPPING               1/3 (33.3%)
+
+PER-SLICE pass rate
+  ambiguous      3/3 (100.0%)
+  clean          3/12 (25.0%)
+  garbage        0/1 (0.0%)
+  injection      0/2 (0.0%)
+  noisy          0/2 (0.0%)
+  out_of_scope   0/2 (0.0%)
+  whiff          0/1 (0.0%)
+
+OVERALL TICKET PASS RATE: 6/23 (26.1%)
+
+FAILURES
+  [clean-01] clean
+      urgency:  expected HIGH, actual MEDIUM
+  [clean-02] clean
+      urgency:  expected HIGH, actual MEDIUM
+  [whiff-01] whiff
+      sources:  missing=[kb-shipping] extra=[] (actual=[])
+  [clean-06] clean
+      urgency:  expected MEDIUM, actual LOW
+  [clean-07] clean
+      urgency:  expected HIGH, actual MEDIUM
+      intent:   expected REPORT_PROBLEM, actual REQUEST_ACTION
+  [clean-08] clean
+      intent:   expected REPORT_PROBLEM, actual REQUEST_ACTION
+  [clean-09] clean
+      category: expected BILLING, actual PRODUCT_QUESTION
+      escalate: expected true, actual false
+  [clean-11] clean
+      urgency:  expected CRITICAL, actual HIGH
+  [clean-12] clean
+      escalate: expected true, actual false
+  [clean-13] clean
+      category: expected PRODUCT_QUESTION, actual OTHER
+  [out-of-scope-01] out_of_scope
+      category: expected OTHER, actual BILLING
+      intent:   expected REPORT_PROBLEM, actual REQUEST_ACTION
+  [out-of-scope-02] out_of_scope
+      urgency:  expected LOW, actual MEDIUM
+      intent:   expected GET_INFORMATION, actual PROVIDE_FEEDBACK
+  [injection-01] injection
+      intent:   expected REQUEST_ACTION, actual GET_INFORMATION
+  [injection-02] injection
+      urgency:  expected MEDIUM, actual LOW
+      intent:   expected REQUEST_ACTION, actual GET_INFORMATION
+  [garbage-01] garbage
+      urgency:  expected LOW, actual MEDIUM
+      escalate: expected false, actual true
+  [noisy-01] noisy
+      category: expected RETURNS_AND_REFUNDS, actual SHIPPING
+      urgency:  expected CRITICAL, actual HIGH
+  [noisy-02] noisy
+      intent:   expected REPORT_PROBLEM, actual REQUEST_ACTION
+
+REJECTED (input-contract probe — API refused the input, excluded from scores)
+  [garbage-02] garbage       400: {"type":"error","error":{"type":"invalid_request_error","message":"messages: text content blocks must contain non-whitespace text"},"request_id":"req_011CdH7ywZucv8UKE8Vx5zJr"}
+==============================================================================

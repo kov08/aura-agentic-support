@@ -45,7 +45,7 @@ class CachedResolutionServiceTest {
     // and the outage guarantee (OPEN breaker + hit => real answer) rides on the resolver being untouched.
     @Test
     void returnsCachedResolutionWithoutCallingResolver() {
-        Resolution cached = new Resolution("cached answer", List.of("kb-returns"), ResolutionStatus.RESOLVED);
+        Resolution cached = new Resolution("cached answer", List.of("kb-returns"), ResolutionStatus.RESOLVED, false);
         when(keys.resolutionKey(any(), any(), any(), anyDouble(), anyLong())).thenReturn(KEY);
         when(cache.get(KEY)).thenReturn(Optional.of(cached));
 
@@ -58,7 +58,7 @@ class CachedResolutionServiceTest {
     // POLICY: a MISS calls the resolver exactly once and stores the fresh, non-degraded answer.
     @Test
     void callsResolverOnceAndStoresOnMiss() {
-        Resolution fresh = new Resolution("fresh answer", List.of("kb-returns"), ResolutionStatus.RESOLVED);
+        Resolution fresh = new Resolution("fresh answer", List.of("kb-returns"), ResolutionStatus.RESOLVED, false);
         when(keys.resolutionKey(any(), any(), any(), anyDouble(), anyLong())).thenReturn(KEY);
         when(cache.get(KEY)).thenReturn(Optional.empty());
         when(resolver.resolve(TICKET)).thenReturn(fresh);
@@ -76,7 +76,7 @@ class CachedResolutionServiceTest {
     @Test
     void fallbackResolutionIsNeverCached() {
         Resolution escalated = new Resolution(
-                "escalated to a human", List.of(), ResolutionStatus.ESCALATED_TO_HUMAN);
+                "escalated to a human", List.of(), ResolutionStatus.ESCALATED_TO_HUMAN, true);
         when(keys.resolutionKey(any(), any(), any(), anyDouble(), anyLong())).thenReturn(KEY);
         when(cache.get(KEY)).thenReturn(Optional.empty());
         when(resolver.resolve(TICKET)).thenReturn(escalated);
@@ -85,5 +85,24 @@ class CachedResolutionServiceTest {
 
         assertThat(result).isSameAs(escalated);
         verify(cache, never()).put(any(), any());
+    }
+
+    // POLICY (Day 10): a MODEL-CHOSEN escalation is still a knowledge answer and IS cached. This is
+    // the distinction the two escalation channels exist to preserve — the gate keys off `status`
+    // (dependency health), never off `escalate` (business judgment). Cache-skipping every escalation
+    // would mean paying Sonnet again on every repeat of the tickets most likely to repeat, and the
+    // same ticket deserves the same escalation tomorrow anyway.
+    @Test
+    void modelChosenEscalationIsCachedBecauseItIsAKnowledgeAnswer() {
+        Resolution escalating = new Resolution(
+                "I'm escalating this to a specialist.", List.of(), ResolutionStatus.RESOLVED, true);
+        when(keys.resolutionKey(any(), any(), any(), anyDouble(), anyLong())).thenReturn(KEY);
+        when(cache.get(KEY)).thenReturn(Optional.empty());
+        when(resolver.resolve(TICKET)).thenReturn(escalating);
+
+        Resolution result = service.resolve(REQUEST);
+
+        assertThat(result).isSameAs(escalating);
+        verify(cache).put(KEY, escalating);
     }
 }
