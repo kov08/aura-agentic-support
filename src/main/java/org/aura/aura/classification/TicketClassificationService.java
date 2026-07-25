@@ -13,6 +13,7 @@ import com.anthropic.models.messages.StructuredTextBlock;
 import io.github.resilience4j.circuitbreaker.CallNotPermittedException;
 import io.github.resilience4j.circuitbreaker.annotation.CircuitBreaker;
 import lombok.extern.slf4j.Slf4j;
+import org.aura.aura.resilience.AnthropicTransientFailures;
 import org.springframework.stereotype.Service;
 
 import java.util.Optional;
@@ -137,7 +138,12 @@ public class TicketClassificationService {
         if (cause instanceof CallNotPermittedException
                 || cause instanceof AnthropicIoException
                 || cause instanceof RateLimitException
-                || cause instanceof InternalServerException) {
+                || cause instanceof InternalServerException
+                // Day 11: a hung response (client timeout mid-read) surfaces as
+                // AnthropicInvalidDataException caused by a timeout — a dependency hang, so degrade to
+                // human review like any other outage. A malformed body (non-timeout cause) is excluded
+                // and still rethrows below.
+                || AnthropicTransientFailures.isReadTimeout(cause)) {
             // The ONLY site that produces DEPENDENCY_UNAVAILABLE — the one reason meaning "no model
             // answer exists". Everything reaching here failed before Claude ever replied.
             return fallback(ReviewReason.DEPENDENCY_UNAVAILABLE,
