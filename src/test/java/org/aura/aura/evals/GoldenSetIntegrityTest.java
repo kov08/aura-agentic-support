@@ -26,7 +26,10 @@ import static org.assertj.core.api.Assertions.assertThatCode;
 class GoldenSetIntegrityTest {
 
     private static final int EXPECTED_TICKET_COUNT = 24;
-    private static final int GOLDEN_SET_VERSION = 1;
+    // Bumped 1 -> 2 with golden-set-v2: the labelingPolicy legislation plus four relabels decided by it.
+    // The set version and labelingPolicy.version are intentionally the SAME number and move together —
+    // a set carrying policy vN is exactly the set relabelled under law vN — so one constant checks both.
+    private static final int GOLDEN_SET_VERSION = 2;
 
     // The legal slice values. `whiff` joined the set when clean-04 was split out into its own
     // retrieval-failure family; keeping the list here means an unknown slice fails this test loudly.
@@ -42,6 +45,25 @@ class GoldenSetIntegrityTest {
         assertThatCode(GoldenSetLoader::load).doesNotThrowAnyException();
         assertThat(goldenSet.goldenSetVersion()).isEqualTo(GOLDEN_SET_VERSION);
         assertThat(goldenSet.tickets()).isNotNull();
+    }
+
+    // The labelingPolicy is v2's written law. This asserts only its PRESENCE and SHAPE (present, right
+    // version, no blank rule) — never that the rules are wise, which only human review decides. A v2 set
+    // that lost its policy, or shipped a rule as an empty string, is a rot this catches loudly.
+    @Test
+    void labelingPolicyIsPresentAndComplete() {
+        LabelingPolicy policy = goldenSet.labelingPolicy();
+        assertThat(policy).as("labelingPolicy must be present on a v%d set", GOLDEN_SET_VERSION).isNotNull();
+        assertThat(policy.version())
+                .as("labelingPolicy.version travels with goldenSetVersion")
+                .isEqualTo(GOLDEN_SET_VERSION);
+        assertThat(policy.intentUnderInjection()).as("intentUnderInjection law").isNotBlank();
+        assertThat(policy.categoryTieBreak()).as("categoryTieBreak law").isNotBlank();
+        // urgencyRubric is a frozen verbatim copy of the classifier-v2 <urgency_rubric>; its provenance
+        // stamp lives in a separate field so the copy stays character-comparable to the prompt block.
+        // Shape only — that the copy is faithful is a human-diff decision, not something this can judge.
+        assertThat(policy.urgencyRubric()).as("urgencyRubric law").isNotBlank();
+        assertThat(policy.urgencyRubricSource()).as("urgencyRubric provenance stamp").isNotBlank();
     }
 
     @Test
