@@ -208,19 +208,13 @@
                  which never match *IT). They start a real Redis container (Testcontainers, needs Docker)
                  and a local MockWebServer, so they are slower and have a hard Docker prerequisite.
 
-                 A dummy ANTHROPIC_API_KEY is injected so the AnthropicClient bean's fromEnv() can build
-                 at context startup WITHOUT a real key — every call is redirected to MockWebServer via the
-                 base-url seam, so the key is never sent anywhere real or validated. This env var is scoped
-                 to the Failsafe fork ONLY: it does not touch Surefire or the `-Pevals` runner, which use
-                 the real key from the ambient environment. -->
+                 No API-key wiring is needed here: key presence is governed entirely by the validated
+                 aura.anthropic.api-key property, which the "test" profile defaults to ${ANTHROPIC_API_KEY:test-key}
+                 — a dummy when absent (all IT calls go to MockWebServer, which never checks auth). One rule,
+                 no Failsafe-vs-config branch to drift. -->
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-failsafe-plugin</artifactId>
-                <configuration>
-                    <environmentVariables>
-                        <ANTHROPIC_API_KEY>test-dummy-key-unused-all-calls-go-to-mockwebserver</ANTHROPIC_API_KEY>
-                    </environmentVariables>
-                </configuration>
                 <executions>
                     <execution>
                         <goals>

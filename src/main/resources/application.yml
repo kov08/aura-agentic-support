@@ -19,6 +19,10 @@ aura:
   # profile; the identical name IS the drift guard — the integration tests drive the exact properties
   # production reads, so the seam is configuration, not a code branch.
   anthropic:
+    # Binds from the ANTHROPIC_API_KEY env var (name unchanged). @NotBlank on AnthropicProperties makes
+    # a missing/blank key fail the context at startup with a clear message, instead of a late 401 on the
+    # first Claude call. The empty default means "absent" -> blank -> fail fast (not a silent empty key).
+    api-key: ${ANTHROPIC_API_KEY:}
     base-url: ""     # empty in prod → the SDK's default endpoint (api.anthropic.com). Integration
                      # tests set this to a local MockWebServer via @DynamicPropertySource.
     timeout: 30s     # per-request time bound; the test profile overrides this to 500ms

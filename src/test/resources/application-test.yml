@@ -4,6 +4,12 @@
 # here (max-attempts, retry-exceptions, breaker config, redis host/port) is inherited unchanged.
 aura:
   anthropic:
+    # MockWebServer never checks auth; the dummy keeps the presence law universal — one rule, no profile
+    # branches to drift. Written as ${ANTHROPIC_API_KEY:test-key} rather than a bare "test-key" for one
+    # reason: EvalRunner ALSO runs under this profile and makes REAL calls (-Pevals), so a hardcoded
+    # dummy would 401 every eval. Real key when present (evals), dummy otherwise (MockWebServer ITs) —
+    # either way non-blank, so @NotBlank is satisfied in every test context.
+    api-key: ${ANTHROPIC_API_KEY:test-key}
     # prod is 30s; a tight bound so the hang-conversion IT (a 2s delayed response) trips the timeout
     # in milliseconds and asserts a fallback OUTCOME, never an elapsed time.
     timeout: 500ms
