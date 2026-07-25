@@ -5,8 +5,85 @@ on Spring Boot and the Claude Messages API. Each "Day" adds one capability on to
 
 ## Prerequisites
 
-- JDK 21+
+- JDK 25 (the toolchain the build targets; see `<java.version>` in [pom.xml](pom.xml))
 - `ANTHROPIC_API_KEY` exported in your environment (the client reads it via `fromEnv()`)
+- Docker running — the Redis cache (Day 9) and the integration tests (Day 11) use it
+
+## Reproducibility (fresh clone → running)
+
+The contract: a clean checkout reaches a verified, running agent in these exact steps. `verify` is the
+gate — it runs the fast offline unit/integrity/scorer tests (Surefire) **and** the full-context
+integration tests against a real Redis container and a local MockWebServer (Failsafe, needs Docker).
+
+```bash
+git clone <repo-url> && cd aura-agentic-support/aura
+```
+
+```bash
+docker compose up -d
+```
+
+```powershell
+$env:ANTHROPIC_API_KEY = "sk-ant-..."
+```
+
+```bash
+.\mvnw.cmd verify
+```
+
+```bash
+.\mvnw.cmd spring-boot:run
+```
+
+Then one request (PowerShell shown; the app listens on `:8080`):
+
+```bash
+curl -s -X POST http://localhost:8080/api/v1/tickets/T-1001/resolve -H "Content-Type: application/json" -d "{\"message\":\"Where is my order #88231? It was due Tuesday.\"}"
+```
+
+Expected response shape (values vary; `outcome` is `RESOLVED`, or `ESCALATED_TO_HUMAN` when Claude is
+degraded and the resolver fell back to a human):
+
+```json
+{
+  "ticketId": "T-1001",
+  "resolutionText": "…the customer-facing reply…",
+  "outcome": "RESOLVED",
+  "sourcesUsed": ["kb-…"],
+  "classification": {
+    "category": "ORDER_STATUS",
+    "urgency": "HIGH",
+    "intent": "GET_INFORMATION",
+    "confidence": 0.93,
+    "needsHumanReview": false
+  }
+}
+```
+
+### Request path (`POST /resolve`) — one layer per line, with the day it was built
+
+```
+POST /api/v1/tickets/{id}/resolve
+  │
+  ▼  TicketController ................ Day 5  · HTTP seam: @Valid, maps HTTP ⇄ domain, no business logic
+  │
+  ├─▶ TicketClassificationService ... Day 6  · native structured outputs (Haiku), runs FIRST as a cheap gate
+  │      └ @CircuitBreaker ........... Day 8  · shared "anthropicApi" breaker (no retry — fallback is cheap)
+  │
+  ▼  CachedResolutionService ........ Day 9  · Redis cache-aside — a HIT returns here and skips everything below
+  │      (MISS ↓)
+  ▼  ResolverService.resolve ........ Day 4  · KB retrieve → augment → resolve (Sonnet)
+  │      ├ @Retry + @CircuitBreaker .. Day 8  · transient allowlist retry, breaker, escalate-to-human fallback
+  │      └ structured ResolverOutput . Day 10 · the escalate verdict is DATA, not prose
+  │
+  ▼  AnthropicClient (SDK) .......... Day 1  · shared OkHttp client bean, SDK retries disabled (maxRetries=0)
+  │      └ base-url + timeout ........ Day 11 · configurable transport seam (prod endpoint, or MockWebServer in ITs)
+  ▼
+  Anthropic Messages API
+```
+
+Both the classifier and resolver calls go through the same SDK client, so the Day 11 base-url/timeout
+seam redirects and time-bounds *every* upstream call from one place.
 
 ## Day 1 — Skeleton & First Call
 
