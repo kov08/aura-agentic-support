@@ -1,0 +1,21 @@
+# Day 11 test profile (@ActiveProfiles("test")). SAME property KEYS as prod application.yml — the
+# identical name IS the drift guard: the integration tests drive the exact properties production
+# reads, only with test values. Profile properties override the base per-key; everything not named
+# here (max-attempts, retry-exceptions, breaker config, redis host/port) is inherited unchanged.
+aura:
+  anthropic:
+    # prod is 30s; a tight bound so the hang-conversion IT (a 2s delayed response) trips the timeout
+    # in milliseconds and asserts a fallback OUTCOME, never an elapsed time.
+    timeout: 500ms
+    # base-url is injected per-class via @DynamicPropertySource (the MockWebServer port), not here —
+    # each IT class binds its own server. The key still lives in prod config; only the value is dynamic.
+
+resilience4j:
+  retry:
+    instances:
+      anthropicApi:
+        wait-duration: 50ms                # prod 1s → shorten so retry scenarios run in ms
+        enable-exponential-backoff: false  # deterministic, minimal waits under test
+        enable-randomized-wait: false      # no jitter — keeps IT timing tight and predictable
+        # max-attempts (3) and retry-exceptions are INHERITED from application.yml: the retry
+        # BEHAVIOUR (count + which exceptions) is held fixed; only the WAIT is shortened.

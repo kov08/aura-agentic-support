@@ -2,9 +2,12 @@ package org.aura.aura;
 
 import com.anthropic.client.AnthropicClient;
 import com.anthropic.client.okhttp.AnthropicOkHttpClient;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.context.annotation.Bean;
+
+import java.time.Duration;
 
 @SpringBootApplication
 public class AuraApplication {
@@ -19,16 +22,31 @@ public class AuraApplication {
     // lifecycle; the OkHttp connection pool lives for the whole application run and is reused
     // across every request thread.
     @Bean
-    public AnthropicClient anthropicClient() {
-        return AnthropicOkHttpClient.builder()
+    public AnthropicClient anthropicClient(
+            // Day 11 (TASK 3) — the two seam properties, injected from config (see application.yml and
+            // the test profile). Defaults here mirror prod so the bean is correct even if the keys are
+            // absent: no base-url override, a 30s timeout.
+            @Value("${aura.anthropic.base-url:}") String baseUrl,
+            @Value("${aura.anthropic.timeout:30s}") Duration timeout) {
+        // Test seam. Production sets no base-url; integration tests point this at a local MockWebServer
+        // via @DynamicPropertySource. The seam is config, not a code branch.
+        AnthropicOkHttpClient.Builder builder = AnthropicOkHttpClient.builder()
                 // fromEnv() on the builder loads ANTHROPIC_API_KEY (and any other ANTHROPIC_*
                 // settings) from the environment, exactly as the old fromEnv() shortcut did —
                 // it just leaves the builder open so we can override defaults below.
                 .fromEnv()
-                // ADR-012: Resilience4j owns the full retry policy. SDK retries disabled
+                // ADR-012/016: Resilience4j owns the full retry policy. SDK retries disabled
                 // to prevent layered-retry multiplication (SDK 3 × app 3 = 9 calls/request).
                 .maxRetries(0)
-                .build();
+                // Applied ALWAYS (prod 30s, test 500ms). A per-request time bound is exactly what lets
+                // the Day 11 hang-conversion IT turn a slow response into a fallback OUTCOME rather than
+                // asserting on elapsed wall-clock.
+                .timeout(timeout);
+        // Applied ONLY when present. Empty (the prod default) leaves the SDK's built-in endpoint intact.
+        if (baseUrl != null && !baseUrl.isBlank()) {
+            builder.baseUrl(baseUrl);
+        }
+        return builder.build();
     }
 
     // Day 1 smoke test — kept as a comment to document the progression. It proved the raw

@@ -113,6 +113,49 @@
             <artifactId>spring-boot-starter-test</artifactId>
             <scope>test</scope>
         </dependency>
+
+        <!-- Day 11 (TASK 2) — integration-test dependencies, all test-scope. -->
+
+        <!-- MockWebServer: a REAL local HTTP server the AnthropicClient talks to over the wire, so the
+             integration tests exercise the SDK's actual transport (JSON (de)serialization, per-request
+             timeout, connection handling) instead of a Mockito stub at the Java boundary (D1a). NOT
+             managed by the spring-boot BOM, so the version is pinned: 4.12.0 is the last okhttp3-namespaced
+             MockWebServer (package okhttp3.mockwebserver); okhttp 5 renamed it to mockwebserver3. -->
+        <dependency>
+            <groupId>com.squareup.okhttp3</groupId>
+            <artifactId>mockwebserver</artifactId>
+            <version>4.12.0</version>
+            <scope>test</scope>
+        </dependency>
+
+        <!-- Testcontainers + Spring Boot: real Redis in a container so the Day 9 cache layer runs for
+             real under test. spring-boot-testcontainers brings @ServiceConnection (auto-wires
+             spring.data.redis.* to the container); junit-jupiter brings @Testcontainers/@Container.
+             Versions managed by the spring-boot BOM (Testcontainers 2.0.5). -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-testcontainers</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <!-- NOTE: Testcontainers 2.x renamed every module with a `testcontainers-` prefix, so the
+             JUnit 5 integration is `testcontainers-junit-jupiter` (was `junit-jupiter` in TC 1.x).
+             It pulls in the Testcontainers core transitively. Version managed by the BOM (2.0.5). -->
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>testcontainers-junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <!-- Redis container module. There is NO official `org.testcontainers:redis` module; Spring Boot
+             4.1's BOM instead manages the community `com.redis:testcontainers-redis` (2.2.4), which
+             gives a first-class RedisContainer with Spring Boot @ServiceConnection support — cleaner
+             and more robust than a bare GenericContainer wired by hand. Version managed by the BOM,
+             curated to be compatible with Testcontainers 2.0.5. -->
+        <dependency>
+            <groupId>com.redis</groupId>
+            <artifactId>testcontainers-redis</artifactId>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 
     <build>
@@ -158,6 +201,34 @@
                 <configuration>
                     <excludedGroups>eval</excludedGroups>
                 </configuration>
+            </plugin>
+
+            <!-- Day 11 (TASK 2/8) — integration tests (*IT) run under Failsafe in the `verify` phase,
+                 kept OUT of the fast Surefire `test` phase (Surefire's default patterns are *Test/Tests,
+                 which never match *IT). They start a real Redis container (Testcontainers, needs Docker)
+                 and a local MockWebServer, so they are slower and have a hard Docker prerequisite.
+
+                 A dummy ANTHROPIC_API_KEY is injected so the AnthropicClient bean's fromEnv() can build
+                 at context startup WITHOUT a real key — every call is redirected to MockWebServer via the
+                 base-url seam, so the key is never sent anywhere real or validated. This env var is scoped
+                 to the Failsafe fork ONLY: it does not touch Surefire or the `-Pevals` runner, which use
+                 the real key from the ambient environment. -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-failsafe-plugin</artifactId>
+                <configuration>
+                    <environmentVariables>
+                        <ANTHROPIC_API_KEY>test-dummy-key-unused-all-calls-go-to-mockwebserver</ANTHROPIC_API_KEY>
+                    </environmentVariables>
+                </configuration>
+                <executions>
+                    <execution>
+                        <goals>
+                            <goal>integration-test</goal>
+                            <goal>verify</goal>
+                        </goals>
+                    </execution>
+                </executions>
             </plugin>
         </plugins>
     </build>
