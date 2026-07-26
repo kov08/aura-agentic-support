@@ -502,9 +502,13 @@ idle curiosity → LOW). Honest caveats, recorded so the next cycle starts clean
 sample at `temperature=1.0`, so the small category/intent wobble is noise-consistent for an urgency-only
 change rather than a real regression (e.g. a one-off `clean-05` category flip), and a confirmation run
 would tighten the estimate; the "take the higher" rule flipped `ambiguous-01` (wrong-size **and**
-double-charge) to CRITICAL/BILLING against its HIGH/RETURNS tie-break label — a label worth re-reviewing,
-alongside `clean-06` and `injection-02` where the rubric's answer looks more defensible than the
-original label. The full before/after trail lives in `docs/evals/`.
+double-charge) to CRITICAL/BILLING against its HIGH/RETURNS tie-break label — a label flagged here for
+re-review, alongside `clean-06` and `injection-02` where the rubric's answer looked more defensible than
+the original label. **Resolved in Day 11:** golden-set v2 wrote `labelingPolicy` first (an
+`intentUnderInjection` law, a `categoryTieBreak` law, and an `urgencyRubric` frozen verbatim from this
+classifier prompt) and relabelled all three tickets against that written law — see
+`GoldenSetIntegrityTest` and `src/test/resources/evals/golden-set-v2.json`. The full before/after trail
+lives in `docs/evals/`.
 
 Run (same as Day 1):
 
