@@ -4,9 +4,11 @@ import com.anthropic.client.AnthropicClient;
 import com.anthropic.client.okhttp.AnthropicOkHttpClient;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 
 @SpringBootApplication
+@EnableConfigurationProperties(AnthropicProperties.class)
 public class AuraApplication {
 
     public static void main(String[] args) {
@@ -19,16 +21,27 @@ public class AuraApplication {
     // lifecycle; the OkHttp connection pool lives for the whole application run and is reused
     // across every request thread.
     @Bean
-    public AnthropicClient anthropicClient() {
-        return AnthropicOkHttpClient.builder()
-                // fromEnv() on the builder loads ANTHROPIC_API_KEY (and any other ANTHROPIC_*
-                // settings) from the environment, exactly as the old fromEnv() shortcut did —
-                // it just leaves the builder open so we can override defaults below.
-                .fromEnv()
-                // ADR-012: Resilience4j owns the full retry policy. SDK retries disabled
+    public AnthropicClient anthropicClient(AnthropicProperties props) {
+        // Wired from the validated AnthropicProperties record (not the env ad hoc): a blank/missing
+        // ANTHROPIC_API_KEY has already failed the context at binding time, so by the time we get here
+        // the key is guaranteed present. Test seam: production sets no base-url; integration tests point
+        // this at a local MockWebServer via @DynamicPropertySource. The seam is config, not a code branch.
+        AnthropicOkHttpClient.Builder builder = AnthropicOkHttpClient.builder()
+                // The key comes from config now, so a missing key is a clear startup error rather than a
+                // late 401 on the first call.
+                .apiKey(props.apiKey())
+                // ADR-012/016: Resilience4j owns the full retry policy. SDK retries disabled
                 // to prevent layered-retry multiplication (SDK 3 × app 3 = 9 calls/request).
                 .maxRetries(0)
-                .build();
+                // Applied ALWAYS (prod 30s, test 500ms). A per-request time bound is exactly what lets
+                // the Day 11 hang-conversion IT turn a slow response into a fallback OUTCOME rather than
+                // asserting on elapsed wall-clock.
+                .timeout(props.timeout());
+        // Applied ONLY when present. Empty (the prod default) leaves the SDK's built-in endpoint intact.
+        if (props.baseUrl() != null && !props.baseUrl().isBlank()) {
+            builder.baseUrl(props.baseUrl());
+        }
+        return builder.build();
     }
 
     // Day 1 smoke test — kept as a comment to document the progression. It proved the raw

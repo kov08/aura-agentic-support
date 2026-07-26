@@ -19,6 +19,7 @@ import io.github.resilience4j.circuitbreaker.annotation.CircuitBreaker;
 import io.github.resilience4j.retry.annotation.Retry;
 import lombok.extern.slf4j.Slf4j;
 import org.aura.aura.ResolverPromptProvider;
+import org.aura.aura.resilience.AnthropicTransientFailures;
 import org.springframework.stereotype.Service;
 
 import java.util.List;
@@ -149,6 +150,16 @@ public class ResolverService {
                 || cause instanceof InternalServerException
                 || cause instanceof AnthropicIoException) {
             log.warn("Claude transient failure, retries exhausted; escalating ticket to a human. cause={}",
+                    cause.toString());
+            return escalated();
+        }
+        // Day 11: a hung response (client timeout mid-read) surfaces as AnthropicInvalidDataException
+        // caused by a timeout, NOT AnthropicIoException. That is a dependency hang — fail fast to a
+        // human, not a 5xx. A malformed body (same type, non-timeout cause) is excluded and still
+        // rethrows below. NOT retried (see AnthropicTransientFailures): retrying a hang only stacks
+        // timeouts before the same escalation.
+        if (AnthropicTransientFailures.isReadTimeout(cause)) {
+            log.warn("Claude response read timed out; escalating ticket to a human. cause={}",
                     cause.toString());
             return escalated();
         }

@@ -1,0 +1,21 @@
+# IT-only environment: fake transport at localhost. Short timeout/waits prove MECHANISMS (wiring,
+# fallback paths) cheaply; production VALUES are a runbook config-review item. Evals share `test` but
+# not `it` — real API calls need real timeouts.
+#
+# Property KEYS are identical to prod/test — the shared name is the drift guard: these tests drive the
+# exact properties production reads, only faster. Activated by the *IT classes via
+# @ActiveProfiles({"test","it"}); `it` is listed last, so these values win over test/prod on overlap.
+aura:
+  anthropic:
+    timeout: 500ms   # tight bound so the hang-conversion IT (a 2s delayed response) trips in ms and
+                     # asserts a fallback OUTCOME, never an elapsed time
+
+resilience4j:
+  retry:
+    instances:
+      anthropicApi:
+        wait-duration: 50ms                # prod 1s → shorten so retry scenarios run in ms
+        enable-exponential-backoff: false  # deterministic, minimal waits under test
+        enable-randomized-wait: false      # no jitter — keeps IT timing tight and predictable
+        # max-attempts (3) and retry-exceptions are INHERITED from application.yml: the retry
+        # BEHAVIOUR (count + which exceptions) is held fixed; only the WAIT is shortened.

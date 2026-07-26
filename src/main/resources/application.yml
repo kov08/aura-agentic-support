@@ -15,6 +15,17 @@ spring:
 # Response-cache tuning. Kept OUT of spring.* on purpose: this is AURA's own policy, not a
 # framework setting.
 aura:
+  # Day 11 (TASK 3) — the Anthropic transport seam. These keys exist with the SAME NAMES in every
+  # profile; the identical name IS the drift guard — the integration tests drive the exact properties
+  # production reads, so the seam is configuration, not a code branch.
+  anthropic:
+    # Binds from the ANTHROPIC_API_KEY env var (name unchanged). @NotBlank on AnthropicProperties makes
+    # a missing/blank key fail the context at startup with a clear message, instead of a late 401 on the
+    # first Claude call. The empty default means "absent" -> blank -> fail fast (not a silent empty key).
+    api-key: ${ANTHROPIC_API_KEY:}
+    base-url: ""     # empty in prod → the SDK's default endpoint (api.anthropic.com). Integration
+                     # tests set this to a local MockWebServer via @DynamicPropertySource.
+    timeout: 30s     # per-request time bound; the test profile overrides this to 500ms
   cache:
     ttl: 24h   # Spring binds "24h" to java.time.Duration — TTL is config, not a magic number
 

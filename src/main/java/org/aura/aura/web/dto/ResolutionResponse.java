@@ -9,7 +9,7 @@ import java.util.List;
 public record ResolutionResponse(
         String ticketId,
         String resolutionText,
-        String outcome,           // "RESOLVED" today; real escalation states arrive Day 16
+        String outcome,           // the ResolutionStatus name: RESOLVED or ESCALATED_TO_HUMAN (Day 11)
         List<String> sourcesUsed, // trust signal: empty list on a confident answer is a smell
         // Day 6: the classification that preceded this resolution rides along in the
         // response. Today it's informational (and the routing hook for Day 7+); exposing
@@ -26,7 +26,12 @@ public record ResolutionResponse(
         return new ResolutionResponse(
                 ticketId,
                 resolution.answer(),  // Resolution's accessor for the resolved text
-                "RESOLVED",            // TODO Day 16: map real outcome/escalation flag
+                // Day 11: map the REAL transport status onto the wire (was hardcoded "RESOLVED"). This is
+                // what lets a client — and the Day 11 integration tests — tell a normal answer apart from
+                // a degraded ESCALATED_TO_HUMAN fallback during an Anthropic outage. status is the
+                // single-writer dependency-health channel (see ResolutionStatus); the model's own
+                // escalate verdict remains a separate concern surfaced elsewhere.
+                resolution.status().name(),
                 resolution.sourcesUsed(),
                 classification
         );

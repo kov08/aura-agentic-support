@@ -8,14 +8,14 @@ import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 
 /**
- * Loads {@code golden-set-v1.json} from the test classpath. Shared by {@link GoldenSetIntegrityTest}
+ * Loads {@code golden-set-v2.json} from the test classpath. Shared by {@link GoldenSetIntegrityTest}
  * (which asserts it is well-formed) and {@link EvalRunner} (which runs it) so both read the exact
  * same file through the exact same mapper — one source, no drift between what we validate and what
  * we score.
  */
 public final class GoldenSetLoader {
 
-    public static final String RESOURCE = "/evals/golden-set-v1.json";
+    public static final String RESOURCE = "/evals/golden-set-v2.json";
 
     // A plain Jackson 3 mapper. Records deserialize natively; an illegal enum value (a renamed
     // category, a typo'd urgency) throws HERE, which is exactly the loud failure the integrity test
