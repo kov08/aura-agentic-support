@@ -67,10 +67,12 @@ once Day 24 metrics exist.
 | Redis connect / command timeout | **250 ms / 250 ms** | `spring.data.redis.*` — same file |
 | Response cache TTL | **24 h** | `aura.cache.ttl` — same file |
 
-**Test-profile overrides** (proof-of-mechanism only, never shipped):
-`aura.anthropic.timeout: 500ms` and `resilience4j.retry...wait-duration: 50ms` in
-[application-test.yml](../src/test/resources/application-test.yml) — SAME keys as prod, only faster, so
-the integration tests exercise the exact production code path in milliseconds.
+**Integration-test overrides** (proof-of-mechanism only, never shipped):
+`aura.anthropic.timeout: 500ms` and `resilience4j.retry...wait-duration: 50ms` live in
+[application-it.yml](../src/test/resources/application-it.yml) — SAME keys as prod, only faster, so the
+integration tests exercise the exact production code path in milliseconds. They sit in the `it` profile,
+NOT the shared `test` profile, so EvalRunner (which shares `test` but makes real `-Pevals` calls) keeps
+the prod-like 30s timeout.
 
 **Review checklist.**
 

@@ -1,27 +1,15 @@
-# Day 11 test profile (@ActiveProfiles("test")). SAME property KEYS as prod application.yml — the
-# identical name IS the drift guard: the integration tests drive the exact properties production
-# reads, only with test values. Profile properties override the base per-key; everything not named
-# here (max-attempts, retry-exceptions, breaker config, redis host/port) is inherited unchanged.
+# Day 11 shared "test" profile — activated by every full-context test: AuraApplicationTests, EvalRunner,
+# and (together with `it`) the *IT classes. Its job here is narrow and prod-like: exclude
+# ConversationRunner (@Profile("!test"), a dev-time live Claude call) and guarantee a non-blank API key.
+#
+# It deliberately does NOT shorten timeouts or retry waits — those aggressive, MockWebServer-only values
+# live in application-it.yml. EvalRunner shares `test` but NOT `it`, so its -Pevals live calls keep the
+# prod-like timeout from application.yml (30s). One profile, one job; the fast values are opt-in via `it`.
 aura:
   anthropic:
     # MockWebServer never checks auth; the dummy keeps the presence law universal — one rule, no profile
-    # branches to drift. Written as ${ANTHROPIC_API_KEY:test-key} rather than a bare "test-key" for one
-    # reason: EvalRunner ALSO runs under this profile and makes REAL calls (-Pevals), so a hardcoded
-    # dummy would 401 every eval. Real key when present (evals), dummy otherwise (MockWebServer ITs) —
-    # either way non-blank, so @NotBlank is satisfied in every test context.
+    # branches to drift. ${ANTHROPIC_API_KEY:test-key}: the real key when present (EvalRunner -Pevals
+    # live calls), a dummy otherwise (MockWebServer ITs). Either way non-blank, so @NotBlank is satisfied.
     api-key: ${ANTHROPIC_API_KEY:test-key}
-    # prod is 30s; a tight bound so the hang-conversion IT (a 2s delayed response) trips the timeout
-    # in milliseconds and asserts a fallback OUTCOME, never an elapsed time.
-    timeout: 500ms
-    # base-url is injected per-class via @DynamicPropertySource (the MockWebServer port), not here —
-    # each IT class binds its own server. The key still lives in prod config; only the value is dynamic.
-
-resilience4j:
-  retry:
-    instances:
-      anthropicApi:
-        wait-duration: 50ms                # prod 1s → shorten so retry scenarios run in ms
-        enable-exponential-backoff: false  # deterministic, minimal waits under test
-        enable-randomized-wait: false      # no jitter — keeps IT timing tight and predictable
-        # max-attempts (3) and retry-exceptions are INHERITED from application.yml: the retry
-        # BEHAVIOUR (count + which exceptions) is held fixed; only the WAIT is shortened.
+    # base-url is injected per-class by the ITs via @DynamicPropertySource (the MockWebServer port);
+    # under plain `test` it stays the application.yml default (the SDK endpoint), which is what evals need.

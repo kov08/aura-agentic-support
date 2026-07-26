@@ -31,8 +31,10 @@ import static org.assertj.core.api.Assertions.assertThat;
  * the customer must not be able to tell. This class uses its OWN Redis container because it STOPS Redis
  * mid-test; it must never share a container with {@link AnthropicTransportIT}.
  */
+// "test" excludes ConversationRunner + supplies the API key; "it" adds the aggressive MockWebServer-only
+// timeout/retry-wait overrides (listed last, so it wins). Evals use "test" alone and keep prod timeouts.
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
-@ActiveProfiles("test")
+@ActiveProfiles({"test", "it"})
 @Testcontainers
 class RedisDegradationIT {
 
