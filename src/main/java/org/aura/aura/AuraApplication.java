@@ -2,13 +2,17 @@ package org.aura.aura;
 
 import com.anthropic.client.AnthropicClient;
 import com.anthropic.client.okhttp.AnthropicOkHttpClient;
+import org.aura.aura.config.VoyageProperties;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 
 @SpringBootApplication
-@EnableConfigurationProperties(AnthropicProperties.class)
+// Day 12 adds VoyageProperties alongside AnthropicProperties: two external dependencies, two
+// validated transport configs, one startup gate. Registering it here is what makes the @NotBlank key
+// check and the model-family assertion run at context load rather than on the first embedding call.
+@EnableConfigurationProperties({AnthropicProperties.class, VoyageProperties.class})
 public class AuraApplication {
 
     public static void main(String[] args) {

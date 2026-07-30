@@ -7,6 +7,9 @@ on Spring Boot and the Claude Messages API. Each "Day" adds one capability on to
 
 - JDK 25 (the toolchain the build targets; see `<java.version>` in [pom.xml](pom.xml))
 - `ANTHROPIC_API_KEY` exported in your environment (the client reads it via `fromEnv()`)
+- `VOYAGE_API_KEY` exported in your environment (Day 12 embeddings). Both keys are validated at
+  startup, so a missing one fails the context immediately rather than on the first call — see
+  `.env.example` for the names
 - Docker running — the Redis cache (Day 9) and the integration tests (Day 11) use it
 
 ## Reproducibility (fresh clone → running)
@@ -25,6 +28,10 @@ docker compose up -d
 
 ```powershell
 $env:ANTHROPIC_API_KEY = "sk-ant-..."
+```
+
+```powershell
+$env:VOYAGE_API_KEY = "pa-..."
 ```
 
 ```bash
@@ -514,4 +521,76 @@ Run (same as Day 1):
 
 ```bash
 ./mvnw spring-boot:run
+```
+
+## Day 12 — RAG foundations: a real corpus, a chunker, and embeddings
+
+Day 4's knowledge base matched keywords, and Day 4's own transcript recorded its failure mode: a
+reworded return question retrieved nothing and the model fell back on the system prompt. Day 12 lays
+the groundwork for fixing that with meaning-based retrieval instead of string overlap.
+
+### The corpus is data now
+
+`kb/` holds three real ShopFast policies (refund, shipping, warranty) as committed markdown. This is
+the ADR-007a endgame: **domain facts never live in prompts.** A policy in a prompt string makes a
+policy change a code change, hides it from whoever owns it, and puts it somewhere retrieval cannot
+see. `kb/` is what Day 15's ingestion pipeline reads. One section — refund policy's *International
+Orders* — is deliberately oversized so the recursive fallback runs on genuine prose, and a test keeps
+it that way.
+
+### `DocumentChunker` — structure first, characters last
+
+Markdown headings are the author's own statement of where one idea ends, so they define the chunks,
+and the full heading path becomes a **breadcrumb** (`Refund Policy > International Orders`) that is
+embedded alongside the body — a chunk stripped of its heading is nearly meaningless on its own. Only
+a section over the cap falls back to character splitting, and it descends a hierarchy ranked by how
+much meaning a cut destroys: **blank line → sentence end → space → hard cut.** Consecutive sub-chunks
+share ~300 characters of overlap, never across a heading, and each is labelled `(part i/n)` under the
+shared section path. The 2,000-character cap is a stated *approximation* of ~500 tokens (~4 chars per
+token) — there is no clean JVM build of Voyage's tokenizer, so the proxy is set well below the real
+limit rather than tuned against it.
+
+### `VoyageEmbeddingClient` — two lanes, two models
+
+One HTTP call underneath, two methods on top, and the split is the point:
+
+| Lane | Method | Model | Cost shape |
+|---|---|---|---|
+| Offline ingestion | `embedDocuments` | `voyage-4-large` | paid **once** per document |
+| Per-ticket query | `embedQuery` | `voyage-4-lite` | paid on **every** ticket |
+
+Spending the better model where the cost is amortised and the cheaper one where it recurs is the Day 20
+cost thesis one layer below the classifier/resolver split. Both the model *and* the required
+`input_type` are derived from the method the caller chose, so a mismatched pair is unrepresentable —
+important because a mismatch produces perfectly valid vectors that simply retrieve worse, with no error
+anywhere. For the same reason, `VoyageProperties` refuses to boot if the two model names leave the
+`voyage-4` family: asymmetric models are comparable only inside one shared embedding space, and a
+cross-family pair is silently meaningless rather than loudly broken.
+
+Failures are mapped by an **allowlist**: 408/429/5xx and transport faults become
+`VoyageTransientException`; everything else — 400, 401, 422, and anything unknown — becomes
+`VoyagePermanentException` and is not retried. Resilience4j (`instances.voyage`) is the single retry
+owner, exactly as the Anthropic SDK is pinned to `maxRetries(0)`; retry is safe on *both* lanes here
+only because embedding is an idempotent pure read, which the Day 17 refund tool will not be.
+
+One transport detail worth recording, because it is the Day 11 trap on a different client: a timeout
+that strikes while the response **body** is streaming does not surface as `ResourceAccessException` —
+the headers already arrived, so Spring is inside response extraction and reports a plain
+`RestClientException`. Mapping only the obvious type would have left the most realistic outage shape (a
+provider that accepts the request and then stalls) classified as permanent and never retried.
+
+### The demo
+
+`SemanticSearchDemoIT` chunks the real `kb/` files, embeds them once, and ranks three queries by cosine
+similarity over a brute-force in-memory scan — which is precisely what pgvector replaces on Day 13.
+The off-topic control query ("Do you sell scuba diving gear?") still returns a ranked "best" match:
+cosine scores are **relative, not calibrated**, so relevance gating is a separate decision, not a free
+property of retrieval. It is billable and manual, so it is tagged and excluded like the evals:
+
+```bash
+./mvnw verify          # unit + integration tests; the demo is excluded
+```
+
+```bash
+./mvnw verify -Pdemo   # the semantic-search demo only (needs VOYAGE_API_KEY; makes live calls)
 ```

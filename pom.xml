@@ -215,6 +215,25 @@
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-failsafe-plugin</artifactId>
+                <configuration>
+                    <!-- REQUIRED on a Spring Boot project, and silently broken without it. Failsafe
+                         runs AFTER `package`, and once the project artifact exists it prefers that jar
+                         over target/classes — but spring-boot-maven-plugin's `repackage` has by then
+                         rewritten the jar into an executable fat jar whose application classes live
+                         under BOOT-INF/classes. That layout is invisible to a plain classpath, so every
+                         *IT dies with NoClassDefFoundError on the first application class it touches
+                         (observed: org/aura/aura/chunker/DocumentChunker). Pointing Failsafe back at
+                         the exploded output directory is the documented fix. -->
+                    <classesDirectory>${project.build.outputDirectory}</classesDirectory>
+
+                    <!-- Day 12 — the same law the eval tag established for Surefire, now on the
+                         integration side. SemanticSearchDemoIT is an *IT (so Surefire skips it) but it
+                         is NOT a build gate: it hits the live Voyage API, costs money per run, and its
+                         real output is a ranked table a human reads. Tagging it "manual" and excluding
+                         that group keeps `mvn verify` free, offline-except-for-Docker, and safe to run
+                         on a machine with no VOYAGE_API_KEY. The `demo` profile below inverts it. -->
+                    <excludedGroups>manual</excludedGroups>
+                </configuration>
                 <executions>
                     <execution>
                         <goals>
@@ -254,6 +273,42 @@
                             <includes>
                                 <include>**/evals/EvalRunner.java</include>
                             </includes>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+
+        <!-- `mvn verify -Pdemo` runs ONLY the manual group — today that is SemanticSearchDemoIT. It
+             needs a live VOYAGE_API_KEY and makes real (billable) embedding calls.
+
+             combine.self="override" for the same load-bearing reason as the evals profile: without it
+             Maven MERGES this into the base Failsafe config, the base's <excludedGroups>manual</…>
+             survives alongside this <groups>manual</groups>, and an excluded group beats an included
+             one — zero tests selected. "override" replaces the base config outright.
+
+             Surefire is silenced here so the demo run does not also re-execute the whole unit suite:
+             the point of -Pdemo is the ranked table, not a second opinion on the fast tests. -->
+        <profile>
+            <id>demo</id>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-failsafe-plugin</artifactId>
+                        <configuration combine.self="override">
+                            <!-- Repeated, not inherited: "override" REPLACES the base configuration
+                                 wholesale, so dropping this line would restore the fat-jar classpath
+                                 bug for exactly the profile that needs to run an IT. -->
+                            <classesDirectory>${project.build.outputDirectory}</classesDirectory>
+                            <groups>manual</groups>
+                        </configuration>
+                    </plugin>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-surefire-plugin</artifactId>
+                        <configuration combine.self="override">
+                            <skipTests>true</skipTests>
                         </configuration>
                     </plugin>
                 </plugins>

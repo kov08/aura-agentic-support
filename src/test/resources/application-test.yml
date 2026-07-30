@@ -13,3 +13,11 @@ aura:
     api-key: ${ANTHROPIC_API_KEY:test-key}
     # base-url is injected per-class by the ITs via @DynamicPropertySource (the MockWebServer port);
     # under plain `test` it stays the application.yml default (the SDK endpoint), which is what evals need.
+
+# Day 12 — same presence law, second dependency. The @NotBlank on VoyageProperties applies to every
+# context, so a full-context test that never embeds anything still needs a non-blank key.
+# ${VOYAGE_API_KEY:test-key}: the real key when present (SemanticSearchDemoIT under -Pdemo makes live
+# calls), a dummy otherwise. SemanticSearchDemoIT asserts the key is NOT the dummy before it starts,
+# so the fallback can never quietly turn a live demo into a 401.
+voyage:
+  api-key: ${VOYAGE_API_KEY:test-key}

@@ -29,6 +29,36 @@ aura:
   cache:
     ttl: 24h   # Spring binds "24h" to java.time.Duration — TTL is config, not a magic number
 
+# --- Day 12: Voyage embeddings + chunking ------------------------------------------------------
+# Top-level (not under aura.*) because this is a second EXTERNAL dependency's transport config, the
+# sibling of aura.anthropic.* — the two blocks are deliberately shaped alike.
+voyage:
+  # Binds from the VOYAGE_API_KEY env var. @NotBlank on VoyageProperties makes a missing/blank key
+  # fail the context at startup, same law as ANTHROPIC_API_KEY. The empty default means "absent" ->
+  # blank -> fail fast, never a silent empty key.
+  api-key: ${VOYAGE_API_KEY:}
+  base-url: https://api.voyageai.com   # tests point this at a local MockWebServer; the seam is config
+
+  # THE asymmetric pair. Model names live here, not as literals in the client: changing the family is
+  # not a config tweak, it obsoletes every stored vector and forces a full corpus re-embed, and that
+  # consequence should be visible in a config diff. VoyageProperties enforces at startup that both
+  # names share the voyage-4 family — asymmetric models are only comparable inside one shared space.
+  document-model: voyage-4-large   # premium, ONE-TIME offline ingestion lane
+  query-model: voyage-4-lite       # economy, PER-TICKET online lane
+
+  # Explicit, never inherited (the Day 9 Redis lesson: an un-set timeout defaulted to 60s).
+  # Provisional values: Day 14 splits these into per-lane budgets, because a batch ingestion call and
+  # a single customer query have nothing in common except the endpoint they hit.
+  connect-timeout: 2s
+  read-timeout: 5s
+
+  # Chunk sizing. 2000 chars is a ~500-token proxy at the ~4-chars-per-token English heuristic — an
+  # approximation, stated as one, because there is no clean JVM build of Voyage's tokenizer. The
+  # chunker packs to (max - overlap) and then prepends the overlap, so every chunk is under the cap
+  # by construction.
+  max-chunk-chars: 2000
+  overlap-chars: 300
+
 # --- Resilience4j: one dependency (Claude / the Anthropic API), two policies -------------------
 # Both instances are named "anthropicApi" on purpose: the retry and the breaker are two policies on
 # the SAME dependency, and the shared name keeps this file telling that story at a glance. The
@@ -51,6 +81,28 @@ resilience4j:
           - com.anthropic.errors.RateLimitException     # HTTP 429 — rate limited
           - com.anthropic.errors.InternalServerException # HTTP 5xx incl. 529 overloaded
           - com.anthropic.errors.AnthropicIoException    # connection reset / socket timeout (no HTTP status)
+      # Day 12 — the Voyage embeddings API. Resilience4j is the SINGLE retry owner here too: the
+      # RestClient inside VoyageEmbeddingClient has no retry of its own, for the same reason the
+      # Anthropic SDK is pinned to maxRetries(0) — layered retries multiply (3 × 3 = 9 calls), they
+      # do not add.
+      voyage:
+        max-attempts: 3                     # TOTAL attempts (1 original + up to 2 retries)
+        wait-duration: 500ms
+        enable-exponential-backoff: true
+        exponential-backoff-multiplier: 2   # waits ~0.5s, ~1s between attempts
+        enable-randomized-wait: true
+        # ALLOWLIST of exactly one type. VoyageEmbeddingClient decides transient-vs-permanent at the
+        # mapping site, where the HTTP status is still in hand, and encodes the verdict in the
+        # exception TYPE — so this list never has to re-derive it. A VoyagePermanentException (400 /
+        # 401 / 422) and any unknown exception are not listed, and therefore not retried: unknown
+        # failures fail closed.
+        #
+        # Retry is safe on BOTH lanes because embedding is an idempotent pure read — same input, same
+        # vector, nothing created or charged twice. That is a property of THIS operation, not a
+        # general licence: the Day 17 refund tool performs a real money movement and must not inherit
+        # this policy.
+        retry-exceptions:
+          - org.aura.aura.client.VoyageTransientException
   circuitbreaker:
     instances:
       anthropicApi:
