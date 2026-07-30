@@ -29,6 +29,36 @@ aura:
   cache:
     ttl: 24h   # Spring binds "24h" to java.time.Duration — TTL is config, not a magic number
 
+# --- Day 12: Voyage embeddings + chunking ------------------------------------------------------
+# Top-level (not under aura.*) because this is a second EXTERNAL dependency's transport config, the
+# sibling of aura.anthropic.* — the two blocks are deliberately shaped alike.
+voyage:
+  # Binds from the VOYAGE_API_KEY env var. @NotBlank on VoyageProperties makes a missing/blank key
+  # fail the context at startup, same law as ANTHROPIC_API_KEY. The empty default means "absent" ->
+  # blank -> fail fast, never a silent empty key.
+  api-key: ${VOYAGE_API_KEY:}
+  base-url: https://api.voyageai.com   # tests point this at a local MockWebServer; the seam is config
+
+  # THE asymmetric pair. Model names live here, not as literals in the client: changing the family is
+  # not a config tweak, it obsoletes every stored vector and forces a full corpus re-embed, and that
+  # consequence should be visible in a config diff. VoyageProperties enforces at startup that both
+  # names share the voyage-4 family — asymmetric models are only comparable inside one shared space.
+  document-model: voyage-4-large   # premium, ONE-TIME offline ingestion lane
+  query-model: voyage-4-lite       # economy, PER-TICKET online lane
+
+  # Explicit, never inherited (the Day 9 Redis lesson: an un-set timeout defaulted to 60s).
+  # Provisional values: Day 14 splits these into per-lane budgets, because a batch ingestion call and
+  # a single customer query have nothing in common except the endpoint they hit.
+  connect-timeout: 2s
+  read-timeout: 5s
+
+  # Chunk sizing. 2000 chars is a ~500-token proxy at the ~4-chars-per-token English heuristic — an
+  # approximation, stated as one, because there is no clean JVM build of Voyage's tokenizer. The
+  # chunker packs to (max - overlap) and then prepends the overlap, so every chunk is under the cap
+  # by construction.
+  max-chunk-chars: 2000
+  overlap-chars: 300
+
 # --- Resilience4j: one dependency (Claude / the Anthropic API), two policies -------------------
 # Both instances are named "anthropicApi" on purpose: the retry and the breaker are two policies on
 # the SAME dependency, and the shared name keeps this file telling that story at a glance. The
