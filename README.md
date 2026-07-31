@@ -594,3 +594,46 @@ property of retrieval. It is billable and manual, so it is tagged and excluded l
 ```bash
 ./mvnw verify -Pdemo   # the semantic-search demo only (needs VOYAGE_API_KEY; makes live calls)
 ```
+
+### Lab: what the family check does *not* protect (`lab/CrossModelDemoIT`)
+
+`VoyageProperties` refuses to boot on a cross-family pair, and that check earns its keep — setting
+`query-model: voyage-3.5-lite` fails the context at binding time, on property
+`voyage.modelFamilyConsistent`, before Tomcat binds a port and before any HTTP call exists.
+
+But it validates the **configuration**, and the dangerous state is in the **data**: a migration that
+re-points the query lane without re-embedding the corpus leaves a store of `voyage-4-large` vectors
+being searched by `voyage-3.5-lite` queries. At every instant the config is internally valid. The
+check is a guard on a transition it never observes. `lab/CrossModelDemoIT` stages exactly that, by
+constructing `VoyageProperties` directly — the canonical constructor bypasses JSR-303, because Bean
+Validation runs through Spring's binder — and ranks an 8-chunk index both ways. Measured:
+
+| | legitimate | mixed-era |
+|---|---|---|
+| top-1 score | 0.3730 (`Refund Policy > Standard Refund Window`) | −0.0293 (`Shipping Policy > Lost Parcels`) |
+| spread, top-1 to last | 0.1527 | 0.0263 |
+| all 8 scores | 0.220 … 0.373 | −0.056 … −0.029 |
+
+**Nothing throws, nothing warns, the build is green.** Both vectors are 1024-dimensional, so
+`VectorMath`'s guard is satisfied — it catches a *shape* mismatch, not a *space* mismatch. The only
+trace anywhere is an INFO line correctly naming a different model, which is accurate and is not an
+alert.
+
+The signal that does work is a **canary**: embed one fixed probe string through both lanes and
+compare. Measured on the same sentence —
+
+| probe comparison | cosine |
+|---|---|
+| `voyage-4-large`(doc) vs `voyage-4-lite`(query) — healthy | **0.6900** |
+| `voyage-4-large`(doc) vs `voyage-3.5-lite`(query) — mixed era | **−0.0247** |
+| `voyage-4-lite`(query) vs `voyage-3.5-lite`(query) | 0.0025 |
+
+Two asymmetric models in one space agree at 0.69 on identical text, not 1.0 — each lane carries a
+different internal instruction, so the healthy value has to be *measured*, never assumed. Across
+eras it collapses to zero. That 0.71 gap is enormous next to the ~0.095 window available for a
+relevance threshold, which makes an ingestion-time canary a far better-conditioned check than
+anything score-based. Day 13/15 should store the corpus's embedding model alongside the vectors and
+assert this probe on startup.
+
+One caution on precision: identical back-to-back runs returned 0.3739 and 0.3730 for the same
+top-1. Voyage is not bit-reproducible, so no threshold should be pinned to three decimals.
