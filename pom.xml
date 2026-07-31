@@ -216,14 +216,33 @@
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-failsafe-plugin</artifactId>
                 <configuration>
-                    <!-- REQUIRED on a Spring Boot project, and silently broken without it. Failsafe
-                         runs AFTER `package`, and once the project artifact exists it prefers that jar
-                         over target/classes — but spring-boot-maven-plugin's `repackage` has by then
-                         rewritten the jar into an executable fat jar whose application classes live
-                         under BOOT-INF/classes. That layout is invisible to a plain classpath, so every
-                         *IT dies with NoClassDefFoundError on the first application class it touches
-                         (observed: org/aura/aura/chunker/DocumentChunker). Pointing Failsafe back at
-                         the exploded output directory is the documented fix. -->
+                    <!-- REQUIRED for `verify -Pdemo`. Failsafe runs AFTER `package`, and once the
+                         project artifact exists it can prefer that jar over target/classes — but
+                         spring-boot-maven-plugin's `repackage` has by then rewritten the jar into an
+                         executable fat jar whose application classes live under BOOT-INF/classes,
+                         which is invisible to a plain classpath. Pointing Failsafe back at the
+                         exploded output directory is the documented fix.
+
+                         SCOPE, measured rather than assumed (2026-07-31, on two throwaway worktrees):
+
+                           | invocation       | without this line          | with it |
+                           | `verify`         | BUILD SUCCESS, 6 ITs pass  | same    |
+                           | `verify -Pdemo`  | NoClassDefFoundError:      | passes  |
+                           |                  | org/aura/aura/chunker/     |         |
+                           |                  | DocumentChunker            |         |
+
+                         So this is NOT a pre-existing breakage in the Day 11 ITs: a worktree at
+                         5878bd7 (pre-Day-12 main, before this line existed) runs `verify` green with
+                         both AnthropicTransportIT and RedisDegradationIT passing. An earlier revision
+                         of this comment claimed otherwise; the counterfactual disproves it.
+
+                         The mechanism behind the profile-vs-plain difference is NOT established.
+                         Surefire's <skipTests> override in the `demo` profile was ruled out (removing
+                         it still reproduces the failure), which leaves the profile's own Failsafe
+                         <configuration combine.self="override"> as the remaining suspect — untested.
+                         Recorded as an open question rather than guessed at, because the guess is
+                         exactly what went wrong the first time. What IS certain: remove this line and
+                         `-Pdemo` breaks, reproducibly. -->
                     <classesDirectory>${project.build.outputDirectory}</classesDirectory>
 
                     <!-- Day 12 — the same law the eval tag established for Surefire, now on the
@@ -298,8 +317,11 @@
                         <artifactId>maven-failsafe-plugin</artifactId>
                         <configuration combine.self="override">
                             <!-- Repeated, not inherited: "override" REPLACES the base configuration
-                                 wholesale, so dropping this line would restore the fat-jar classpath
-                                 bug for exactly the profile that needs to run an IT. -->
+                                 wholesale. Dropping this line breaks THIS profile specifically —
+                                 verified by removing it and reproducing the NoClassDefFoundError. See
+                                 the measured scope table on the base plugin above; note also that this
+                                 override block is itself the leading suspect for why `-Pdemo` needs
+                                 the line at all while a plain `verify` does not. -->
                             <classesDirectory>${project.build.outputDirectory}</classesDirectory>
                             <groups>manual</groups>
                         </configuration>
