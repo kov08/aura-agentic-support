@@ -1,54 +1,74 @@
 package org.aura.aura;
 
-import org.aura.aura.chunker.DocumentChunker;
 import org.aura.aura.client.VoyageEmbeddingClient;
 import org.aura.aura.config.VoyageProperties;
-import org.aura.aura.domain.Chunk;
+import org.aura.aura.ingest.KbCorpusLoader;
+import org.aura.aura.store.ChunkRepository;
+import org.aura.aura.store.KbChunk;
+import org.aura.aura.util.VectorLiterals;
 import org.aura.aura.util.VectorMath;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
 import org.springframework.test.context.ActiveProfiles;
+import org.testcontainers.containers.PostgreSQLContainer;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.junit.jupiter.Testcontainers;
+import org.testcontainers.utility.DockerImageName;
 
-import java.io.IOException;
-import java.io.UncheckedIOException;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.util.ArrayList;
-import java.util.Comparator;
 import java.util.List;
-import java.util.stream.Stream;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * End-to-end semantic search over the real {@code kb/} corpus, against the real Voyage API. NOT part
- * of any automatic build: it is tagged {@code "manual"} and excluded by Failsafe, exactly as the
- * golden-set eval is tagged {@code "eval"} and excluded by Surefire — same reason, too. It costs
- * money, needs a live key, and its interesting output is a ranked table a human reads, not a boolean
- * a machine checks. Run it with {@code mvn verify -Pdemo} and a real {@code VOYAGE_API_KEY}.
+ * End-to-end semantic search over the real {@code kb/} corpus, against the real Voyage API — now
+ * retrieving from Postgres instead of from an ArrayList. NOT part of any automatic build: it is tagged
+ * {@code "manual"} and excluded by Failsafe, exactly as the golden-set eval is tagged {@code "eval"}
+ * and excluded by Surefire. It costs money, needs a live key, and its interesting output is a ranked
+ * table a human reads, not a boolean a machine checks. Run it with {@code mvn verify -Pdemo} and a
+ * real {@code VOYAGE_API_KEY}.
  *
- * <p>What it proves that the unit tests cannot: that chunking, breadcrumbs, the asymmetric model pair,
- * and cosine ranking compose into retrieval that actually works on prose nobody wrote for the test —
- * a paraphrased question with almost no lexical overlap with its answer. That is precisely the failure
- * the Day 4 keyword knowledge base had (a reworded return question retrieved nothing), so this is the
- * first evidence the RAG track fixes it.
+ * <h2>What changed on Day 13</h2>
+ * Day 12's version of this test chunked the corpus, embedded it, and then ranked it with a hand-written
+ * loop over an in-memory list — "brute force, on purpose", with a note that pgvector replaces it. This
+ * is that replacement, and the diff is the lesson: the chunking and the embedding are unchanged and
+ * have moved into {@link KbCorpusLoader}; the ranking loop is gone entirely, replaced by
+ * {@code ORDER BY embedding <=> ?} in {@link ChunkRepository#findNearest}. The index is not magic — it
+ * was always this loop, and what the database adds is that the corpus no longer has to fit in the JVM
+ * or be re-embedded on every restart.
  *
- * <h2>Brute force, on purpose</h2>
- * The ranking below is a full linear scan: every query is compared against every chunk in memory.
- * That is exactly what pgvector replaces tomorrow (Day 13), and writing it out by hand once is the
- * cheapest way to make the replacement legible — the index is not magic, it is this loop with an
- * ANN structure and persistence bolted on. At ~50 chunks the loop is instant; at 50,000 it is the
- * whole latency budget.
+ * <p>The corpus IS re-embedded on every run here, because the container is fresh each time. That is a
+ * property of running a demo against a throwaway database, not of the design: the same loader against
+ * the compose Postgres skips an already-populated table and costs nothing.
  */
 @Tag("manual")
 @ActiveProfiles("test")   // suppresses ConversationRunner (@Profile("!test")), a dev-time live Claude call
-@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.NONE)
+@SpringBootTest(
+        webEnvironment = SpringBootTest.WebEnvironment.NONE,
+        properties = {
+                // Opt back in to the database: application-test.yml keeps DataSourceAutoConfiguration
+                // excluded so the DB-less majority of the suite needs no Docker. See PgVectorSchemaIT.
+                "spring.autoconfigure.exclude=",
+                // Creates the KbCorpusLoader bean AND fires it: its ApplicationRunner runs during
+                // context startup, so the corpus is already ingested by the time the first test method
+                // executes. (Measured, not assumed — an earlier revision of this comment claimed
+                // runners do not fire under @SpringBootTest, and the demo's own log disproved it:
+                // "load COMPLETE — 33 chunks" during startup, then "load SKIPPED" from the explicit
+                // call below.) The test calls load() anyway, and that second call is the point: it is
+                // the skip guard demonstrating itself against a corpus that is already populated.
+                "aura.kb.load=true"
+        })
+@Testcontainers
 class SemanticSearchDemoIT {
 
-    private static final Path KB = Path.of("kb");
     private static final int TOP_K = 3;
+
+    @Container
+    @ServiceConnection
+    static final PostgreSQLContainer<?> POSTGRES = new PostgreSQLContainer<>(
+            DockerImageName.parse("pgvector/pgvector:pg17").asCompatibleSubstituteFor("postgres"));
 
     private static final List<String> QUERIES = List.of(
             "Can I get my money back for a hoodie I bought two weeks ago?",
@@ -57,8 +77,9 @@ class SemanticSearchDemoIT {
             // that it STILL returns three ranked results with plausible-looking scores.
             "Do you sell scuba diving gear?");
 
-    @Autowired DocumentChunker chunker;
+    @Autowired KbCorpusLoader loader;
     @Autowired VoyageEmbeddingClient voyage;
+    @Autowired ChunkRepository chunks;
     @Autowired VoyageProperties props;
 
     @Test
@@ -68,38 +89,38 @@ class SemanticSearchDemoIT {
                         + "(the 'test' profile falls back to the dummy 'test-key' when it is absent)")
                 .isNotEqualTo("test-key");
 
-        // ---- 1. Chunk the real corpus -------------------------------------------------------
-        List<Chunk> chunks = new ArrayList<>();
-        try (Stream<Path> files = Files.list(KB)) {
-            files.filter(p -> p.toString().endsWith(".md"))
-                    .sorted()
-                    .forEach(p -> chunks.addAll(chunker.chunk(read(p), p.getFileName().toString())));
-        } catch (IOException e) {
-            throw new UncheckedIOException("kb/ not found — this test runs from the module directory", e);
-        }
-        assertThat(chunks).as("kb/ must contain chunkable markdown").isNotEmpty();
+        // ---- 1. The corpus is already ingested, and this proves the guard ----------------------
+        // Chunking, embedding, and persistence all live behind one call now, and startup already made
+        // it (see the aura.kb.load note above). Calling it a second time must cost nothing: a
+        // populated table means the expensive work is done, and the loader declines to redo it.
+        KbCorpusLoader.LoadReport report = loader.load();
+        assertThat(report.skipped())
+                .as("a second load against a populated corpus must skip, not re-embed — that guard is "
+                        + "the difference between a free re-run and a billable one")
+                .isTrue();
 
-        // ---- 2. Embed the corpus ONCE, with the premium document model ------------------------
-        // One batch call, one time. This is the offline lane, and its cost is amortised over every
-        // query that will ever run against it — which is the entire argument for spending the better
-        // model here and the cheaper one below.
-        List<float[]> corpus = voyage.embedDocuments(chunks.stream().map(Chunk::embeddingInput).toList());
-        assertThat(corpus).hasSameSizeAs(chunks);
+        long stored = chunks.count();
+        assertThat(stored).as("the corpus must have landed in kb_chunks").isPositive();
 
-        System.out.printf("%n=== Day 12 semantic search demo — %d chunks from %s, dim=%d ===%n",
-                chunks.size(), KB, corpus.getFirst().length);
+        System.out.printf("%n=== Day 13 semantic search demo — %d chunks in pgvector ===%n", stored);
         System.out.printf("document model=%s   query model=%s%n%n", props.documentModel(), props.queryModel());
 
-        // ---- 3. One query at a time, with the economy query model -----------------------------
+        // ---- 2. One query at a time, with the economy query model ------------------------------
         for (String query : QUERIES) {
             float[] queryVector = voyage.embedQuery(query);
 
-            List<Ranked> top = rank(chunks, corpus, queryVector);
+            // THE replacement. Postgres does the scoring, the sorting, and the truncation; the JVM
+            // holds one vector and three rows instead of the entire corpus.
+            List<KbChunk> top = chunks.findNearest(VectorLiterals.toLiteral(queryVector), TOP_K);
 
             System.out.println("query: " + query);
-            for (Ranked r : top) {
+            for (KbChunk chunk : top) {
+                // The ORDER above is pgvector's. This number recomputes the same quantity locally for
+                // display — `<=>` is cosine distance, which is exactly 1 - cosine similarity — so the
+                // printed distances are the values that produced the ranking, not a second opinion.
+                double distance = 1.0 - VectorMath.cosineSimilarity(chunk.getEmbedding(), queryVector);
                 System.out.printf("   %.4f  %-58s  [%s]%n",
-                        r.score(), truncate(r.chunk().breadcrumb(), 58), r.chunk().sourceDoc());
+                        distance, truncate(chunk.getBreadcrumb(), 58), chunk.getSourceDoc());
             }
             System.out.println();
 
@@ -109,43 +130,20 @@ class SemanticSearchDemoIT {
                 // that is the capability under test. Asserting an exact chunk or a score threshold
                 // would be asserting the model's current weights, which change without warning and
                 // are not ours to pin.
-                assertThat(top.getFirst().chunk().breadcrumb())
+                assertThat(top.getFirst().getBreadcrumb())
                         .as("a paraphrased refund question must rank a Refund Policy section first")
                         .contains("Refund");
             }
         }
 
-        // Left as an observation rather than an assertion: the off-topic scuba query still gets three
-        // ranked hits, because cosine similarity is RELATIVE, not calibrated. There is no absolute
-        // score that means "this is actually relevant" — a "best match" is always returned, however
-        // bad the field. Turning that into a refusal needs a threshold (Day 16) or a grounding check
-        // in the resolver prompt, not a better index.
-        System.out.println("NOTE: the off-topic query still returned a ranked 'best' match — scores are "
+        // Left as an observation rather than an assertion, and unchanged by the move to pgvector: the
+        // off-topic scuba query still gets three ranked hits, because cosine distance is RELATIVE, not
+        // calibrated. There is no absolute value that means "this is actually relevant" — a "best
+        // match" is always returned, however bad the field. A vector database does not fix that; it
+        // needs a threshold (Day 16) or a grounding check in the resolver prompt.
+        System.out.println("NOTE: the off-topic query still returned a ranked 'best' match — distances are "
                 + "relative, not calibrated. Relevance gating is a separate decision, not a free "
-                + "property of retrieval.");
-    }
-
-    private record Ranked(Chunk chunk, double score) {}
-
-    // Brute-force top-k: score everything, sort, take K. See the class javadoc — this loop IS the
-    // thing pgvector replaces, and its shape (score → sort → truncate) survives the replacement.
-    private static List<Ranked> rank(List<Chunk> chunks, List<float[]> corpus, float[] query) {
-        List<Ranked> scored = new ArrayList<>(chunks.size());
-        for (int i = 0; i < chunks.size(); i++) {
-            scored.add(new Ranked(chunks.get(i), VectorMath.cosineSimilarity(corpus.get(i), query)));
-        }
-        return scored.stream()
-                .sorted(Comparator.comparingDouble(Ranked::score).reversed())
-                .limit(TOP_K)
-                .toList();
-    }
-
-    private static String read(Path path) {
-        try {
-            return Files.readString(path);
-        } catch (IOException e) {
-            throw new UncheckedIOException(e);
-        }
+                + "property of retrieval, and moving the search into the database did not change that.");
     }
 
     private static String truncate(String text, int max) {
