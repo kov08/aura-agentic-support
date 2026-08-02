@@ -2,6 +2,7 @@ package org.aura.aura;
 
 import com.anthropic.client.AnthropicClient;
 import com.anthropic.client.okhttp.AnthropicOkHttpClient;
+import org.aura.aura.config.EmbeddingProperties;
 import org.aura.aura.config.VoyageProperties;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
@@ -12,7 +13,10 @@ import org.springframework.context.annotation.Bean;
 // Day 12 adds VoyageProperties alongside AnthropicProperties: two external dependencies, two
 // validated transport configs, one startup gate. Registering it here is what makes the @NotBlank key
 // check and the model-family assertion run at context load rather than on the first embedding call.
-@EnableConfigurationProperties({AnthropicProperties.class, VoyageProperties.class})
+// Day 13 adds EmbeddingProperties — the same gate, but for the vector SPACE rather than a transport.
+// Its full check needs a live database and therefore cannot be a JSR-303 annotation; see
+// EmbeddingDimensionCheck, which runs the half of the assertion that only Postgres can answer.
+@EnableConfigurationProperties({AnthropicProperties.class, VoyageProperties.class, EmbeddingProperties.class})
 public class AuraApplication {
 
     public static void main(String[] args) {
