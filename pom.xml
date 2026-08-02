@@ -96,6 +96,64 @@
              Version is managed by the spring-boot-starter-parent BOM. optional=true
              keeps it off the runtime classpath of downstream consumers (it's a
              compile-time annotation processor only). -->
+        <!-- Day 13: the vector store. JPA/Hibernate + Postgres + Flyway + pgvector, in four parts. -->
+
+        <!-- Spring Data JPA: Hibernate, the DataSource/HikariCP wiring, and the repository
+             infrastructure ChunkRepository is built on. Version managed by the BOM. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-jpa</artifactId>
+        </dependency>
+
+        <!-- Hibernate's vector module — the piece that makes `float[] embedding` a first-class mapped
+             type instead of a byte blob or a hand-written UserType. It contributes the SqlTypes.VECTOR
+             JDBC type and the pgvector column rendering, which is what lets @JdbcTypeCode(VECTOR) +
+             @Array(length = 1024) on KbChunk produce and VALIDATE a `vector(1024)` column. It is a
+             separate artifact from hibernate-core and is NOT pulled in transitively by the JPA starter,
+             so it must be declared. Version is managed by the spring-boot-starter-parent BOM alongside
+             hibernate-core (7.4.1.Final) — the two MUST move together, which is exactly why the version
+             is not pinned here. -->
+        <dependency>
+            <groupId>org.hibernate.orm</groupId>
+            <artifactId>hibernate-vector</artifactId>
+        </dependency>
+
+        <!-- The Postgres JDBC driver. runtime scope on purpose: no application code imports
+             org.postgresql.*, the driver is discovered through java.sql.Driver's ServiceLoader. Keeping
+             it off the compile classpath means a stray `import org.postgresql...` cannot compile, which
+             is the cheap structural guard against leaking a vendor API into the domain. -->
+        <dependency>
+            <groupId>org.postgresql</groupId>
+            <artifactId>postgresql</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+
+        <!-- Flyway owns the schema. Paired with spring.jpa.hibernate.ddl-auto=validate this makes the
+             writer/verifier split explicit: migrations WRITE the schema, Hibernate only CHECKS it, and
+             nothing generates DDL at runtime.
+
+             The STARTER, not a bare org.flywaydb:flyway-core — and that distinction is new in Boot 4.
+             Boot 4 broke the monolithic spring-boot-autoconfigure jar into per-technology modules, and
+             FlywayAutoConfiguration now lives in org.springframework.boot:spring-boot-flyway, which
+             only this starter pulls in. Declaring flyway-core on its own compiles, resolves, and boots
+             — with Flyway silently never running, because nothing registers it. The schema simply
+             never gets created and the first failure is Hibernate's schema validation complaining
+             about a missing table, several layers away from the actual mistake. (Verified: no
+             spring-boot-flyway jar appears on the classpath with flyway-core alone.) Version managed
+             by the BOM. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-flyway</artifactId>
+        </dependency>
+        <!-- REQUIRED, and easy to miss: since Flyway 10 the database-specific support was split out of
+             flyway-core into per-vendor modules. Without this artifact Flyway starts and then fails at
+             runtime with "Unsupported Database: PostgreSQL" — a startup error, not a compile error, so
+             the build stays green while the app cannot boot. -->
+        <dependency>
+            <groupId>org.flywaydb</groupId>
+            <artifactId>flyway-database-postgresql</artifactId>
+        </dependency>
+
         <dependency>
             <groupId>org.projectlombok</groupId>
             <artifactId>lombok</artifactId>
@@ -154,6 +212,19 @@
         <dependency>
             <groupId>com.redis</groupId>
             <artifactId>testcontainers-redis</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <!-- Day 13 — Postgres container module, so the vector store is exercised against a REAL
+             Postgres with a real pgvector extension and real Flyway migrations. An embedded H2 would be
+             worse than no test here: it has no `vector` type, so the one behaviour worth pinning (the
+             column refusing a wrong-dimension vector) cannot exist in it.
+
+             Same TC 2.x rename as the JUnit module above: `postgresql` became
+             `testcontainers-postgresql`. Version managed by the BOM (2.0.5). -->
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>testcontainers-postgresql</artifactId>
             <scope>test</scope>
         </dependency>
     </dependencies>
