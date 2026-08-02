@@ -12,6 +12,32 @@ spring:
       connect-timeout: 250ms   # bounds TCP establishment (covers silent SYN drops)
       timeout: 250ms           # bounds each command's wait for a reply — THIS was the 60s default
 
+  # --- Day 13: the vector store ---------------------------------------------------------------
+  # Unlike Redis above, this is a SOURCE OF TRUTH. Redis failing degrades cost; Postgres failing
+  # stops the boot, because Flyway and Hibernate's schema validation both run at startup. Env-driven
+  # with local-dev defaults that match docker-compose.yml, so a fresh clone runs with no .env at all.
+  datasource:
+    url: jdbc:postgresql://${POSTGRES_HOST:localhost}:${POSTGRES_PORT:5432}/${POSTGRES_DB:aura}
+    username: ${POSTGRES_USER:aura}
+    password: ${POSTGRES_PASSWORD:aura}
+
+  jpa:
+    hibernate:
+      # Flyway WRITES the schema; Hibernate only VERIFIES it. `validate` compares the entity mappings
+      # against the live tables at boot and refuses to start on a mismatch, so schema drift — an entity
+      # field added without a migration, a migration applied without the entity — dies at startup
+      # instead of at the first query that touches the missing column. The alternative defaults are
+      # both worse in the same direction: `update` silently mutates the schema behind Flyway's back
+      # (two writers, one schema, no history), and `none` makes drift undetectable until runtime.
+      ddl-auto: validate
+    # OSIV holds a Hibernate session open for the ENTIRE web request, so a lazy association can be
+    # dereferenced from a controller or a serializer and quietly issue a query — the N+1 that never
+    # appears in the service code. It also keeps a connection checked out of the pool for the whole
+    # request rather than for the duration of the work, so pool exhaustion arrives under load rather
+    # than under query volume. Spring Boot defaults it ON and warns about it; off is the hygienic
+    # setting and it is set explicitly so nobody has to wonder which default is in effect.
+    open-in-view: false
+
 # Response-cache tuning. Kept OUT of spring.* on purpose: this is AURA's own policy, not a
 # framework setting.
 aura:
@@ -29,6 +55,28 @@ aura:
   cache:
     ttl: 24h   # Spring binds "24h" to java.time.Duration — TTL is config, not a magic number
 
+  # Day 13 — the embedding SPACE, as opposed to the embedding TRANSPORT under voyage.* below. It lives
+  # here and not there because the dimension is not a property of the Voyage API, it is a property of
+  # AURA's schema: the same number is baked into `vector(1024)` in V2__create_kb_chunks.sql and into
+  # @Array(length = 1024) on KbChunk. Three copies of one fact is two too many, and the honest
+  # response to that is not to delete two of them — a migration cannot read a Java constant and
+  # Hibernate cannot read SQL — but to CHECK them against each other at every boot. That is
+  # EmbeddingDimensionCheck's whole job.
+  #
+  # 1024 is what voyage-4-large and voyage-4-lite both return. Changing it is not a config tweak: it
+  # obsoletes every stored vector, needs a new migration, and forces a full re-embed of the corpus —
+  # the same consequence the voyage.*-model family check exists to make visible.
+  embedding:
+    dimension: 1024
+
+  # The one-shot corpus loader (KbCorpusLoader). OFF by default, because it is a billable, minutes-long
+  # ingestion pass that has no business running on an ordinary application start.
+  #   ./mvnw spring-boot:run -Daura.kb.load=true
+  kb:
+    load: false
+    dir: kb              # the corpus directory, resolved relative to the working directory
+    force-reload: false  # re-ingest even when kb_chunks is already populated (wipes it first)
+
 # --- Day 12: Voyage embeddings + chunking ------------------------------------------------------
 # Top-level (not under aura.*) because this is a second EXTERNAL dependency's transport config, the
 # sibling of aura.anthropic.* — the two blocks are deliberately shaped alike.
@@ -45,6 +93,9 @@ voyage:
   # names share the voyage-4 family — asymmetric models are only comparable inside one shared space.
   document-model: voyage-4-large   # premium, ONE-TIME offline ingestion lane
   query-model: voyage-4-lite       # economy, PER-TICKET online lane
+  # The vector WIDTH these two produce is aura.embedding.dimension (1024), above. It is deliberately
+  # not repeated here: this block owns which model is called, the schema owns how wide its output is,
+  # and EmbeddingDimensionCheck is what keeps that second fact honest against the live column.
 
   # Explicit, never inherited (the Day 9 Redis lesson: an un-set timeout defaulted to 60s).
   # Provisional values: Day 14 splits these into per-lane budgets, because a batch ingestion call and
