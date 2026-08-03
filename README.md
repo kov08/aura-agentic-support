@@ -10,13 +10,19 @@ on Spring Boot and the Claude Messages API. Each "Day" adds one capability on to
 - `VOYAGE_API_KEY` exported in your environment (Day 12 embeddings). Both keys are validated at
   startup, so a missing one fails the context immediately rather than on the first call — see
   `.env.example` for the names
-- Docker running — the Redis cache (Day 9) and the integration tests (Day 11) use it
+- Docker running — the Redis cache (Day 9), the Postgres/pgvector store (Day 13), and the integration
+  tests (Days 11/13) use it
 
 ## Reproducibility (fresh clone → running)
 
 The contract: a clean checkout reaches a verified, running agent in these exact steps. `verify` is the
 gate — it runs the fast offline unit/integrity/scorer tests (Surefire) **and** the full-context
-integration tests against a real Redis container and a local MockWebServer (Failsafe, needs Docker).
+integration tests against real Redis and Postgres/pgvector containers plus a local MockWebServer
+(Failsafe, needs Docker).
+
+Note the asymmetry between the two containers `docker compose up -d` starts. Redis is a cost layer and
+the app fails *open* when it is missing. Postgres is the system of record and the app does not start
+without it, because Flyway and Hibernate's schema validation both run at boot (Day 13).
 
 ```bash
 git clone <repo-url> && cd aura-agentic-support/aura
@@ -637,3 +643,203 @@ assert this probe on startup.
 
 One caution on precision: identical back-to-back runs returned 0.3739 and 0.3730 for the same
 top-1. Voyage is not bit-reproducible, so no threshold should be pinned to three decimals.
+
+## Day 13 — pgvector: the corpus becomes a database
+
+Day 12 ended with a brute-force scan: every chunk held in an `ArrayList`, every query compared against
+every one of them by a hand-written cosine loop, re-embedded from scratch on every run. Day 13 replaces
+that loop with `ORDER BY embedding <=> ?` and the list with a table. The win is not that Postgres is
+faster at arithmetic — at 33 chunks nothing is slow. It is that the corpus no longer has to fit in the
+JVM or be paid for again on every restart.
+
+### The schema, and the one thing it buys
+
+`kb_chunks` is the Day 12 `Chunk` record plus its vector, given durability, a uniqueness rule, and an
+ordering operator. Two columns carry more weight than their size suggests.
+
+`embedding vector(1024)` puts the dimension in the **type**, not in a check constraint, because
+pgvector makes it part of the type. That is the single most valuable property of this schema: a
+512-dimension vector is not stored-and-mis-ranked, it is *refused*. Everything else here could be
+reimplemented in application code; this cannot, because application code is exactly what would have
+the bug.
+
+`embedding_model text NOT NULL` records which model produced each vector — per row, not per deployment,
+because a corpus can legitimately be mid-migration with half of it re-embedded. The Day 12 lab measured
+what its absence costs: re-point the query lane at a different model era without re-embedding, and
+every score collapses toward zero while nothing throws, nothing warns, and the build stays green.
+
+Day 12 asked for two things here, and this is one of them. The column now exists, so the stale-corpus
+state is *representable* — but nothing yet reads it, so the state is still not *detected*. The
+ingestion-time canary (embed one fixed probe string through both lanes and compare against the stored
+model) remains open, and it is the half that actually raises an alarm. Storing provenance is the
+precondition; checking it is the feature.
+
+`UNIQUE (source_doc, chunk_index)` makes a re-ingestion a *conflict* rather than a silent duplicate.
+Without it, running the loader twice doubles the corpus and every query returns the same passage twice
+at the top — a retrieval defect that presents as a ranking defect. Day 15's upsert will target this
+constraint; today it is the tripwire that makes the missing upsert loud.
+
+### Two writers is one too many
+
+Flyway **writes** the schema; Hibernate (`ddl-auto=validate`) only **checks** it. Nothing generates DDL
+at runtime. The alternatives are both worse in the same direction: `update` silently mutates the schema
+behind Flyway's back — two writers, one schema, no history — and `none` makes drift undetectable until
+the query that touches the missing column. `open-in-view=false` for the adjacent reason: OSIV holds a
+session open across the whole request, hiding lazy-loading queries behind the service layer and pinning
+a connection for the request's full duration rather than for the duration of the work.
+
+### No vector index, on purpose
+
+HNSW and IVFFlat are **approximate** nearest-neighbour structures: they buy speed by agreeing to
+sometimes not return the true top-k. At tens of chunks a sequential scan is both exact and instant, so
+an index would trade away recall for a latency win that does not exist — and it would do it invisibly,
+because a wrong top-k looks exactly like a right one. That makes adding one a decision with a real
+trade-off, not a performance tweak, so it gets an ADR when a *measurement* says the scan has become the
+latency budget. The trigger is written into the migration: p95 scan latency becoming a visible share of
+the per-ticket budget, which at these vector sizes means the low tens of thousands of chunks.
+
+A consequence worth knowing before that day: an HNSW index is built **for one distance operator**, so
+choosing `<=>` also fixes which index can ever serve the query. That is why `ChunkRepository` writes the
+operator out in the SQL instead of hiding it behind a JPQL function — `<=>` cosine, `<->` L2, `<#>`
+negative inner product, and swapping one for another changes every ranking while breaking nothing that
+would fail a test. Note the direction, too: `<=>` is a **distance**, so ascending is
+most-similar-first — the opposite sort from Day 12's cosine *similarity*.
+
+### One number, three languages, checked at every boot
+
+`1024` is written down three times, in three places that cannot read each other: `vector(1024)` in the
+migration, `@Array(length = 1024)` on `KbChunk`, and `aura.embedding.dimension` in `application.yml`. A
+migration cannot read a Java constant and Hibernate cannot read SQL, so the duplication is
+irreducible — which makes the interesting question not "how do we avoid three copies" but "what happens
+when they disagree."
+
+`ddl-auto=validate` already pins the entity to the column. `EmbeddingDimensionCheck` closes the triangle
+by comparing the live column against the configured value and refusing to boot on a mismatch. It is a
+Flyway `AFTER_MIGRATE` callback rather than an `ApplicationRunner` for three reasons: it runs at the one
+moment the schema is guaranteed current, so there is no bean-ordering question; throwing fails the
+context *before* Tomcat binds a port, where a runner would fail after the server is up and would not run
+under `@SpringBootTest` at all; and it takes no `DataSource` in its constructor, so it is simply never
+invoked in the many test contexts that have no database, instead of needing a conditional to keep it
+from exploding.
+
+The catalog query behind it is verified **empirically**, not from documentation. pgvector is documented
+to store the dimension raw in `atttypmod` with none of the `VARHDRSZ` offset `varchar` adds; the test
+asserts that against a real migrated column (`atttypmod` = 1024, `format_type` = `vector(1024)`), so a
+future encoding change fails in a test named after the claim rather than leaving the startup check
+quietly comparing the wrong number.
+
+### The locale trap in eleven lines of string building
+
+`VectorLiterals` exists because the read and write paths do not share a mechanism: Hibernate binds the
+array natively, but a native query parameter carries no entity type, so the query vector must arrive as
+pgvector's text form and be `CAST(? AS vector)` on the far side.
+
+It uses `Float.toString`, not a formatter. `String.format`, `DecimalFormat` and `NumberFormat` all use
+`Locale.getDefault()`, and under a comma-decimal locale `0.1` formats as `0,1` — which inside a
+comma-separated list does not fail, it parses as **two elements**. A 1024-element vector becomes a
+2048-element one and Postgres rejects it with a dimension error naming entirely the wrong problem. The
+code is correct in `en-US` and corrupt in most of Europe and South America, and no amount of local
+testing finds it, because the default locale is ambient state tests inherit rather than set.
+`Float.toString` is locale-independent by specification *and* emits the shortest decimal that
+round-trips, so it is both locale-proof and lossless. Pinned under `de-DE`, `fr-FR`, `pt-BR`.
+
+### The database is opt-in under test
+
+Adding `spring-boot-starter-data-jpa` puts `DataSourceAutoConfiguration` into **every** context,
+including the many that have never touched a database. Handing them all a container would put a hard
+Docker prerequisite on the fast, free, offline `mvn test` suite — the wrong trade, since the DB-less
+tests outnumber the DB tests. So absence is the default and presence is declared:
+`application-test.yml` excludes `DataSourceAutoConfiguration` (Hibernate JPA, Flyway, Spring Data
+repositories and the transaction manager are all conditional on a `DataSource` bean, so they back off
+behind it), and the two Postgres tests opt back in with
+`@SpringBootTest(properties = "spring.autoconfigure.exclude=")`. Three slice tests activate no profile
+at all and carry the exclusion on their own `@EnableAutoConfiguration`.
+
+`mvn test` therefore remains 116 tests, offline, no Docker. Voyage is never called: retrieval *quality*
+belongs in the billable manual demo, but retrieval *mechanics* are properties of Postgres and this
+schema and should be provable for free on every build.
+
+### Two Boot 4 traps, both silent
+
+Boot 4 split the monolithic `spring-boot-autoconfigure` jar into per-technology modules, and both
+consequences fail without an error message.
+
+`org.flywaydb:flyway-core` on its own **does nothing**. `FlywayAutoConfiguration` now lives in
+`org.springframework.boot:spring-boot-flyway`, which only `spring-boot-starter-flyway` pulls in. With
+the bare library the build resolves, compiles, and boots with Flyway silently never running; the first
+symptom is Hibernate complaining about a missing table, several layers from the actual mistake.
+
+`DataSourceAutoConfiguration` moved to `org.springframework.boot.jdbc.autoconfigure`. A stale FQN in
+`spring.autoconfigure.exclude` does **not** error — Boot only rejects an exclusion whose class is on the
+classpath but is not an auto-configuration, so a name resolving to nothing is skipped in silence. The
+wrong package reads exactly like the right one until a test tries to reach `localhost:5432`.
+
+### Measured
+
+Live `-Pdemo` run over the real 33-chunk corpus, retrieving from pgvector:
+
+| query | top-1 | distance |
+|---|---|---|
+| "Can I get my money back for a hoodie I bought two weeks ago?" | `Refund Policy > Standard Refund Window` | 0.6273 |
+| "How long does delivery to Canada take?" | `Shipping Policy > Delivery Speeds and Costs` | 0.5231 |
+| "Do you sell scuba diving gear?" *(control)* | `Shipping Policy > Restricted Destinations` | 0.7456 |
+
+The paraphrased refund question — no shared vocabulary with the policy — lands in the right document,
+which is the Day 4 keyword failure staying fixed. The off-topic control still returns three ranked hits:
+distances are **relative, not calibrated**, and moving the search into a database did not change that.
+Relevance gating remains a separate decision (Day 16), not a free property of retrieval.
+
+### Drill: what happens when you edit an applied migration
+
+One letter changed inside a `--` comment in `V2`, uncommitted, then a restart against the existing
+Compose volume:
+
+```
+Caused by: org.flywaydb.core.api.exception.FlywayValidateException:
+Validate failed: Migrations have failed validation
+Migration checksum mismatch for migration version 2
+-> Applied to database : 732889598
+-> Resolved locally    : -848807693
+```
+
+It fails at **boot**, inside `flywayInitializer`, which `entityManagerFactory` depends on — so
+`ddl-auto=validate` never even gets a turn. And it names the migration and its ledger row, not a table:
+the *schema is perfectly fine*. What is wrong is a disagreement between a file and the record of that
+file having been run.
+
+The same corrupted file passes the Testcontainers suite. A fresh container has no
+`flyway_schema_history`, so there is no prior claim to contradict — Flyway applies V1/V2 and records the
+new checksum. **This class of defect is structurally invisible to the integration suite and always will
+be.** `PgVectorSchemaIT` proves these migrations build a correct schema *from nothing*; it cannot prove
+they are compatible with the databases that already ran them, and every environment that matters is the
+second kind.
+
+The fix is `git checkout --` on the migration. **Not `flyway repair`**, which rewrites
+`flyway_schema_history` to match whatever is now on disk: the ledger is *correct* — it faithfully
+records what ran — and repair resolves the disagreement by destroying the evidence. It also cannot tell
+a comment from a `DROP COLUMN`, and it only fixes the one database it is run against, so every other
+environment still fails. Repair is right when the *ledger* is wrong (clearing a failed non-transactional
+migration; realigning after a deliberate Flyway upgrade that changed the checksum algorithm). This was
+the opposite. **The rule: once a migration is in the history, the file is read-only — forever. Need a
+change? Write V3.**
+
+A corollary, also measured: Flyway checksums line-by-line, so CRLF/LF churn on a Windows checkout does
+*not* trip validation — but one letter in a comment does.
+
+### Commands
+
+```bash
+docker compose up -d
+```
+
+```bash
+./mvnw verify
+```
+
+```bash
+./mvnw spring-boot:run -Daura.kb.load=true
+```
+
+```bash
+./mvnw verify -Pdemo
+```
