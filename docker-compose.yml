@@ -1,7 +1,11 @@
-# Local infrastructure for AURA. Day 9 adds Redis as the response-cache backing store
-# (ADR-018). It is a COST/AVAILABILITY layer, never a source of truth — the app fails open
-# when it is down (see ResolutionCache), so this compose file is a dev convenience, not a
-# hard runtime dependency.
+# Local infrastructure for AURA. Two services, and they are NOT the same kind of thing:
+#
+#   redis    (Day 9)  — a COST/AVAILABILITY layer, never a source of truth. The app fails open when it
+#                       is down (see ResolutionCache), so losing it degrades cost, not correctness.
+#   postgres (Day 13) — the SYSTEM OF RECORD for the retrieval corpus. The app does not fail open when
+#                       it is down; it does not start at all, because Flyway and Hibernate's
+#                       schema validation both run at boot. That asymmetry is deliberate: a stale
+#                       cache is invisible, a missing knowledge base is a wrong answer.
 services:
   redis:
     image: redis:7-alpine
@@ -15,3 +19,39 @@ services:
       interval: 5s
       timeout: 3s
       retries: 5
+
+  postgres:
+    # pgvector's own image = the stock Postgres image with the extension already compiled in. The
+    # alternative — plain `postgres:17` plus a build step that installs pgvector — puts a compiler in
+    # the boot path of a dev database for no benefit. `CREATE EXTENSION vector` (V1) still has to run:
+    # the image ships the extension FILES, it does not enable it in any particular database. That is
+    # why V1 exists as a migration rather than being assumed from the image tag.
+    image: pgvector/pgvector:pg17
+    environment:
+      # Same law as ANTHROPIC_API_KEY / VOYAGE_API_KEY: values come from the environment, and .env is
+      # gitignored. The `:-` defaults are LOCAL DEV credentials only — they exist so a fresh clone can
+      # `docker compose up` without ceremony, and they are deliberately non-secret rather than
+      # committed-and-pretending-to-be-secret. Anything real overrides them from .env.
+      POSTGRES_DB: ${POSTGRES_DB:-aura}
+      POSTGRES_USER: ${POSTGRES_USER:-aura}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-aura}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"   # maps to spring.datasource.url in application.yml
+    healthcheck:
+      # pg_isready, NOT a TCP port check. Postgres binds its port and then runs a first-boot
+      # initialization pass (initdb, the POSTGRES_DB creation, any /docker-entrypoint-initdb.d
+      # scripts) during which connections are refused — so "the port is open" and "the database
+      # accepts queries" are several seconds apart on a cold volume. -U/-d are passed explicitly
+      # because pg_isready otherwise probes the OS user (root), which does not exist as a role.
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-aura} -d ${POSTGRES_DB:-aura}"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    volumes:
+      # A NAMED volume, so the corpus survives `docker compose down` and re-embedding it (a billable
+      # Voyage call over every chunk) is not the price of restarting a container. `down -v` is the
+      # deliberate way to start clean.
+      - aura-pgdata:/var/lib/postgresql/data
+
+volumes:
+  aura-pgdata:

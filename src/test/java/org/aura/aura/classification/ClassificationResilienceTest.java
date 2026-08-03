@@ -11,6 +11,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.autoconfigure.EnableAutoConfiguration;
+import org.springframework.boot.jdbc.autoconfigure.DataSourceAutoConfiguration;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -44,7 +45,11 @@ import static org.mockito.Mockito.when;
 class ClassificationResilienceTest {
 
     @Configuration(proxyBeanMethods = false)
-    @EnableAutoConfiguration
+    // Day 13: this slice does not use a database, and says so. The exclusion lives here rather than in
+    // application-test.yml because this context activates NO profile — it is a hand-assembled slice,
+    // not a full application. Without it, adding spring-boot-starter-data-jpa would make an
+    // Anthropic-resilience test go looking for Postgres on localhost:5432.
+    @EnableAutoConfiguration(exclude = DataSourceAutoConfiguration.class)
     @Import({TicketClassificationService.class, ClassifierPromptProvider.class})
     static class ResilienceTestConfig {
         @Bean

@@ -1,0 +1,17 @@
+-- Turn on pgvector for THIS database.
+--
+-- The pgvector/pgvector:pg17 image ships the extension's compiled files, but a Postgres extension is
+-- enabled per-database, not per-server — a fresh database created from that image still has no
+-- `vector` type until someone runs this. Doing it here rather than assuming it from the image tag is
+-- what makes the schema reproducible against any Postgres that merely HAS pgvector available:
+-- Testcontainers, a managed instance where an operator installed it, a future non-Docker environment.
+--
+-- IF NOT EXISTS makes this re-runnable by hand. Flyway itself will only ever run it once (the
+-- checksum in flyway_schema_history is the real guard), but a migration that cannot be replayed
+-- against a partially-set-up database is a migration that turns a recoverable mistake into a restore.
+--
+-- Deliberately its own migration, not the first three lines of V2. Enabling an extension is a
+-- DATABASE-level privilege operation (it needs superuser or rds_superuser); creating a table is not.
+-- Keeping them apart means an environment where the extension is pre-installed by an operator can
+-- baseline past V1 and still apply V2 unchanged.
+CREATE EXTENSION IF NOT EXISTS vector;

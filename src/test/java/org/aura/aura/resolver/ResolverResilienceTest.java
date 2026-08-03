@@ -17,6 +17,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.autoconfigure.EnableAutoConfiguration;
+import org.springframework.boot.jdbc.autoconfigure.DataSourceAutoConfiguration;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -64,7 +65,10 @@ class ResolverResilienceTest {
     private static final String TICKET = "How long do I have to return something?";
 
     @Configuration(proxyBeanMethods = false)
-    @EnableAutoConfiguration // pulls in Resilience4j + Spring AOP autoconfiguration, and application.yml binding
+    // pulls in Resilience4j + Spring AOP autoconfiguration, and application.yml binding. The exclusion
+    // is Day 13: this slice does not use a database, and it activates no profile, so it cannot inherit
+    // application-test.yml's exclusion — see ClassificationResilienceTest for the same note.
+    @EnableAutoConfiguration(exclude = DataSourceAutoConfiguration.class)
     @Import({ResolverService.class, ResolverPromptProvider.class, HardcodedKnowledgeBase.class})
     static class ResilienceTestConfig {
         // The one external dependency is faked. Deep stubs let client.messages().create(...) be stubbed

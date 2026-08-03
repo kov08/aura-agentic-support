@@ -12,6 +12,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.autoconfigure.EnableAutoConfiguration;
+import org.springframework.boot.jdbc.autoconfigure.DataSourceAutoConfiguration;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -73,7 +74,9 @@ class VoyageEmbeddingClientTest {
     }
 
     @Configuration(proxyBeanMethods = false)
-    @EnableAutoConfiguration
+    // Day 13: this slice does not use a database, and it activates no profile, so it cannot inherit
+    // application-test.yml's exclusion — see ClassificationResilienceTest for the same note.
+    @EnableAutoConfiguration(exclude = DataSourceAutoConfiguration.class)
     @Import(VoyageEmbeddingClient.class)
     static class VoyageTestConfig {
         @Bean

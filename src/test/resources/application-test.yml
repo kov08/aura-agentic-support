@@ -5,6 +5,35 @@
 # It deliberately does NOT shorten timeouts or retry waits — those aggressive, MockWebServer-only values
 # live in application-it.yml. EvalRunner shares `test` but NOT `it`, so its -Pevals live calls keep the
 # prod-like timeout from application.yml (30s). One profile, one job; the fast values are opt-in via `it`.
+# Day 13 — the DATABASE IS OPT-IN under test, and this single line is what makes that true.
+#
+# Adding spring-boot-starter-data-jpa put DataSourceAutoConfiguration on the classpath for EVERY
+# context, including the ones that have never touched a database: AuraApplicationTests, EvalRunner,
+# AnthropicTransportIT, RedisDegradationIT, lab/CrossModelDemoIT. Without this exclusion each of them
+# would fail at startup demanding a JDBC url, and the fix would be to hand them all a Postgres
+# container — which would put a hard Docker prerequisite on the fast, free, offline `mvn test` suite.
+# That trade is the wrong way round: the DB-less tests outnumber the DB tests, so absence is the
+# default and presence is declared.
+#
+# The two classes that DO need Postgres opt back in with @SpringBootTest(properties =
+# "spring.autoconfigure.exclude=") — an explicit empty value at the highest-precedence property
+# source, which replaces this list rather than merging with it. Written as ONE comma-separated string
+# rather than a YAML sequence so that override is a like-for-like replacement of a single property.
+#
+# Excluding DataSourceAutoConfiguration alone is sufficient and deliberate: Hibernate JPA, Flyway,
+# Spring Data JPA repositories and the transaction manager are all conditional on a DataSource bean,
+# so they all back off behind it. One exclusion, one reason, no list to keep in sync.
+#
+# MIND THE PACKAGE. Boot 4 split the monolithic spring-boot-autoconfigure jar into per-technology
+# modules and moved this class from org.springframework.boot.autoconfigure.jdbc to
+# org.springframework.boot.jdbc.autoconfigure. A stale name here does NOT fail — Boot only rejects an
+# exclusion whose class is on the classpath but is not an auto-configuration; a name that resolves to
+# nothing is skipped in silence. So the wrong package reads exactly like the right one until a test
+# tries to reach localhost:5432. (Observed, then fixed.)
+spring:
+  autoconfigure:
+    exclude: org.springframework.boot.jdbc.autoconfigure.DataSourceAutoConfiguration
+
 aura:
   anthropic:
     # MockWebServer never checks auth; the dummy keeps the presence law universal — one rule, no profile
