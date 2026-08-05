@@ -16,6 +16,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -57,10 +58,30 @@ class RetrievalServiceTest {
         when(voyage.embedQuery(TICKET)).thenReturn(new float[]{0.1f, 0.2f});
         when(chunks.findNearestWithDistance(anyString(), eq(K))).thenReturn(List.of());
 
+        // THE WRONG LANE IS STUBBED TO SUCCEED, and that is the whole point of this line.
+        //
+        // Day 14's drill flipped the call site to embedDocuments and this test did fail — but by
+        // accident, not by design: an unstubbed embedDocuments returns Mockito's default EMPTY list,
+        // and RetrievalService's .getFirst() blew up with NoSuchElementException before the verify
+        // below ever executed. The suite was relying on a Mockito default to catch a production lane
+        // flip, and the assertion written for exactly that job was unreachable.
+        //
+        // With the wrong lane made to work, a flipped call site now runs cleanly all the way to the
+        // verify — so the failure is "never wanted embedDocuments here, but invoked", which names the
+        // defect, instead of a stack trace that names a collection.
+        //
+        // lenient(): on the CORRECT code path this stub is deliberately never used, which strict-stub
+        // checking would otherwise report as an unnecessary stubbing.
+        lenient().when(voyage.embedDocuments(any())).thenReturn(List.of(new float[]{0.1f, 0.2f}));
+
         service().retrieve(TICKET);
 
-        verify(voyage).embedQuery(TICKET);
+        // never() FIRST, so it is the assertion that reports. Both are designed and both hold on the
+        // correct path, but only one of them names the DEFECT: "never wanted embedDocuments here, but
+        // invoked" points straight at the flipped lane, where "wanted but not invoked: embedQuery"
+        // makes the reader work out which call took its place.
         verify(voyage, never()).embedDocuments(any());
+        verify(voyage).embedQuery(TICKET);
     }
 
     @Test
