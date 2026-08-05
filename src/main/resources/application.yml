@@ -55,14 +55,55 @@ spring:
   #   already flags the per-lane split as Day 14 work; it remains open, and it is the same shape of
   #   defect as FINDING 2: one number sized for the batch case, silently reused on the hot path.
   #
-  # Nothing above is changed here on purpose. Retrieval latency has not been measured yet, and
-  # replacing an unexamined default with an unmeasured guess is not an improvement — it just moves
-  # the arbitrariness somewhere harder to notice. These are runbook items with a measurement
-  # attached, not a config edit to slip into a feature commit.
+  # FINDINGS 1 AND 2 ARE NOW FIXED, below. Finding 3 (pool size vs a future background ingester) is
+  # left as a runbook item, because it is not a problem until ingestion stops being a one-shot flag.
+  #
+  # WHY THE VALUES COULD BE CHOSEN AT ALL — "fallback-aware sizing". A timeout is only as good as what
+  # happens when it fires, and until Decision 5 landed the answer here was "an HTTP 500". Under that
+  # regime a tight bound is a bad trade: it converts a slow query into an error page, so the safe
+  # setting is a generous one, which is how unbounded defaults survive review.
+  #
+  # Decision 5 changed the consequence, and that is what makes these numbers affordable. Retrieval
+  # failure now degrades to ESCALATED_TO_HUMAN at HTTP 200 — and NOT by coincidence: both timeouts
+  # below surface as exceptions already on that allowlist. Hikari's pool timeout throws
+  # SQLTransientConnectionException, which Spring translates to CannotGetJdbcConnectionException (a
+  # DataAccessResourceFailureException); pgjdbc's socketTimeout raises SQLState 08006, which Spring
+  # maps to DataAccessResourceFailureException too. So firing either one hands the customer a human
+  # agent, not an error page. Sized for the customer's patience rather than the query's worst case.
   datasource:
     url: jdbc:postgresql://${POSTGRES_HOST:localhost}:${POSTGRES_PORT:5432}/${POSTGRES_DB:aura}
     username: ${POSTGRES_USER:aura}
     password: ${POSTGRES_PASSWORD:aura}
+    hikari:
+      # 2000 MILLISECONDS — and the bare number is not sloppiness, it is required. HikariConfig
+      # declares this as a `long` of milliseconds, so Boot's Duration parsing does not apply and
+      # "2000ms" fails to bind. Compare spring.data.redis.timeout above, which IS a Duration and must
+      # be written "250ms". Two timeouts, two units, one file: read the target type, not the
+      # neighbour.
+      #
+      # Replaces a 30s default that was sized for a batch loader that would rather queue than fail.
+      # A ticket has the opposite preference: nobody is helped by a resolution that arrives after
+      # half a minute of pool starvation, and a request that fails fast can degrade while one that
+      # blocks holds a servlet thread for the whole wait.
+      connection-timeout: 2000
+      data-source-properties:
+        # pgjdbc's socketTimeout, and its unit is SECONDS — not milliseconds, and not a Duration.
+        # This is the finding that mattered most in the Day 14 review: unset, there is NO bound at
+        # all on a query's wait for a reply, so a Postgres that accepts the connection and then
+        # stalls hangs the ticket until some other component's patience runs out. That is the Day 9
+        # Redis lesson (an un-set timeout is not "fast by default", it is "unbounded by default")
+        # repeating verbatim on a different driver.
+        #
+        # 2s against a retrieval query whose measured p50 is single-digit milliseconds on a
+        # 33-chunk corpus — roughly two orders of magnitude of headroom, so this fires on a stall,
+        # never on a slow-but-working query.
+        #
+        # SCOPE WORTH NAMING: this applies to EVERY statement on this DataSource, including the
+        # ingestion path. Today that is fine — KbCorpusLoader writes 33 rows in small batches — but
+        # a Day 15 ingester with a genuinely long-running statement would be killed at 2s. When that
+        # lands it needs its own DataSource or its own bound, not a relaxed value here, because
+        # relaxing it here silently un-bounds the customer path again.
+        socketTimeout: 2
 
   jpa:
     hibernate:
