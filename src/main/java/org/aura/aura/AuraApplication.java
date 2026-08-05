@@ -2,7 +2,9 @@ package org.aura.aura;
 
 import com.anthropic.client.AnthropicClient;
 import com.anthropic.client.okhttp.AnthropicOkHttpClient;
+import org.aura.aura.config.CanaryProperties;
 import org.aura.aura.config.EmbeddingProperties;
+import org.aura.aura.config.RetrievalProperties;
 import org.aura.aura.config.VoyageProperties;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
@@ -16,7 +18,12 @@ import org.springframework.context.annotation.Bean;
 // Day 13 adds EmbeddingProperties — the same gate, but for the vector SPACE rather than a transport.
 // Its full check needs a live database and therefore cannot be a JSR-303 annotation; see
 // EmbeddingDimensionCheck, which runs the half of the assertion that only Postgres can answer.
-@EnableConfigurationProperties({AnthropicProperties.class, VoyageProperties.class, EmbeddingProperties.class})
+// Day 14 adds RetrievalProperties (the retrieval POLICY: how many chunks, how much context) and
+// CanaryProperties (the boot-time geometry probe). Same pattern again: the parts of each contract
+// that are answerable from configuration alone are JSR-303 annotations here, and the part that needs
+// a live database and a live Voyage call is RetrievalCanaryCheck.
+@EnableConfigurationProperties({AnthropicProperties.class, VoyageProperties.class,
+        EmbeddingProperties.class, RetrievalProperties.class, CanaryProperties.class})
 public class AuraApplication {
 
     public static void main(String[] args) {

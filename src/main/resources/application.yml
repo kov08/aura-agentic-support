@@ -16,6 +16,49 @@ spring:
   # Unlike Redis above, this is a SOURCE OF TRUTH. Redis failing degrades cost; Postgres failing
   # stops the boot, because Flyway and Hibernate's schema validation both run at startup. Env-driven
   # with local-dev defaults that match docker-compose.yml, so a fresh clone runs with no .env at all.
+  #
+  # --- Day 14 (TASK 6) — HOT-PATH REVIEW OF THESE TIMEOUTS. Findings only; nothing changed. ------
+  #
+  # Yesterday this datasource served an offline batch ingestion. As of today it serves
+  # RetrievalService on every customer ticket, so the values below sit on a customer-facing read for
+  # the first time and deserve to be looked at rather than inherited.
+  #
+  # FINDING 1 — the values below are ALL DEFAULTS. There is no spring.datasource.hikari.* block and
+  # no JDBC connection property anywhere in this file, so what is actually in force is:
+  #     hikari.connection-timeout   30s     (wait for a pooled connection)
+  #     hikari.maximum-pool-size    10
+  #     hikari.validation-timeout   5s
+  #     pgjdbc socketTimeout        UNSET  -> no bound at all on a query's wait for a reply
+  #     pgjdbc connectTimeout       10s
+  #   The unset socketTimeout is the one that matters, and it is the Day 9 Redis lesson repeating
+  #   verbatim on a different driver: an un-set timeout is not "fast by default", it is "unbounded by
+  #   default", and it only shows up when the dependency is already having a bad day. A Postgres that
+  #   accepts the connection and then stalls hangs the retrieval query — and therefore the ticket —
+  #   forever, or until the servlet container gives up on it, which is a different component's
+  #   opinion about our latency budget.
+  #
+  # FINDING 2 — 30s to WAIT FOR A CONNECTION is a batch-shaped number on a customer-facing read.
+  #   It is a reasonable value for KbCorpusLoader, which would rather queue than fail halfway through
+  #   a billable embedding run. It is a poor one for a ticket: nobody is helped by a resolution that
+  #   arrives after half a minute of pool starvation, and a request that fails fast can degrade,
+  #   while one that blocks holds a servlet thread the whole time.
+  #
+  # FINDING 3 — pool size 10 alongside a batch loader that runs in the SAME application. The loader
+  #   is flag-gated and one-shot, so today the two workloads never overlap in practice. Worth naming
+  #   anyway: the moment ingestion becomes a background job (Day 15), one pool serves both a batch
+  #   writer and a latency-sensitive reader, and 10 connections shared between them is where FINDING 2
+  #   stops being theoretical.
+  #
+  # ADJACENT, and outside this block: voyage.read-timeout is 5s for BOTH lanes. That budget was sized
+  #   for a 64-chunk ingestion batch and is now also the bound on the single per-ticket query
+  #   embedding — a call that should complete in well under a second. The comment on that property
+  #   already flags the per-lane split as Day 14 work; it remains open, and it is the same shape of
+  #   defect as FINDING 2: one number sized for the batch case, silently reused on the hot path.
+  #
+  # Nothing above is changed here on purpose. Retrieval latency has not been measured yet, and
+  # replacing an unexamined default with an unmeasured guess is not an improvement — it just moves
+  # the arbitrariness somewhere harder to notice. These are runbook items with a measurement
+  # attached, not a config edit to slip into a feature commit.
   datasource:
     url: jdbc:postgresql://${POSTGRES_HOST:localhost}:${POSTGRES_PORT:5432}/${POSTGRES_DB:aura}
     username: ${POSTGRES_USER:aura}
@@ -76,6 +119,102 @@ aura:
     load: false
     dir: kb              # the corpus directory, resolved relative to the working directory
     force-reload: false  # re-ingest even when kb_chunks is already populated (wipes it first)
+
+  # --- Day 14 (Decisions 2 + 3): retrieval policy ------------------------------------------------
+  retrieval:
+    # CORPUS-RELATIVE, and that is a property of this number, not a caveat about it. 8 ≈ a quarter of
+    # today's 33-chunk corpus — asking for a quarter of everything is a reasonable candidate pool at
+    # this size and would be an absurd one at 10,000 chunks. Revisit at Day 15 ingestion, when the
+    # corpus stops being three policy documents.
+    #
+    # k is the WIDTH OF THE POOL, not the number of chunks the model sees: the token budget and the
+    # adjacency dedup both cut into it, and typically 3-5 of these 8 survive. Widening k costs one
+    # LIMIT clause and buys the packer more distinct material to choose from after dedup; it does not
+    # directly cost prompt tokens. That asymmetry is why k can be generous while the budget is not.
+    k: 8
+    # Measured, 2026-08-04, against the real corpus:
+    #   SELECT count(*), sum, min, avg, median, p90, max OF token_count FROM kb_chunks;
+    #   -> n=33  total=4860  min=67  median=133  avg=147.27  p90=189  max=499
+    #
+    # DERIVATION. The sizing rule was "admit ~4-5 average chunks", which fixes a window:
+    #   4 x 147.27 = 589   (floor)      5 x 147.27 = 736   (ceiling)      700 = 4.75 x avg
+    #
+    # Read that 4.75 as the budget's SIZE in average-chunk units, NOT as an admit count. Packing
+    # STOPS at the budget rather than skipping ahead to something smaller, so a run of exactly-average
+    # chunks admits FOUR (589 spent, 111 left — short of a fifth at 147). The "four to five" behaviour
+    # is real but comes from the median: 700 / 133 = 5.26. The first live ticket landed at 4 chunks /
+    # 599 tokens, which is what both numbers predict.
+    #
+    # WHAT PINNED IT INSIDE THE WINDOW — max=499, and it rules out the bottom half. The budget must
+    # clear the largest chunk or RetrievalService's "packed NOTHING" path becomes reachable and the
+    # ticket is answered ungrounded. Barely clearing it is not enough either:
+    #   at 589 (the window floor):  499 + 133 = 632 > 589  -> a max-size top hit admits ONE chunk
+    #   at 700:                     499 + 133 = 632 < 700  -> it still admits a second
+    # That is the strongest single argument in this decision, and it points upward.
+    #
+    # SHAPE. 31 of the 33 chunks sit between 67 and 194; the only outliers are one 323 and one 499. So
+    # the mean is dragged up by a two-chunk tail and the median is the better description of a typical
+    # chunk — sizing on the mean is conservative in the right direction here. That spread is also why
+    # the budget is expressed in TOKENS rather than as "top 4": how many chunks survive genuinely
+    # varies per ticket, and it should.
+    #
+    # NOT MEASURED, and worth saying so. Between 589 and 736 nothing distinguishes 700 from 690 or
+    # 720 — it is a round number inside an admissible window. More to the point, answer QUALITY has
+    # never been measured against this budget: there is no recall@k sweep and no eval run at 500 vs
+    # 700 vs 900. This number is derived from the corpus's shape and a rule of thumb, not from an
+    # outcome. Day 16's relevance work is where that measurement naturally comes from.
+    #
+    # The unit is the stored token_count: the same ~4-chars-per-token English APPROXIMATION the
+    # chunker uses, because there is no clean JVM build of Voyage's tokenizer. Packing is integer
+    # arithmetic on numbers the database already holds — nothing tokenizes at request time.
+    context-token-budget: 700
+
+  # --- Day 14 (Decision 1): the retrieval canary -------------------------------------------------
+  # Boot-time proof that the query lane and the stored corpus are still in the same embedding space.
+  # Full rationale on CanaryProperties; the operational consequence is stated plainly here:
+  #
+  #   WITH THIS ON, BOOTING REQUIRES VOYAGE TO BE REACHABLE. That is not a bug to be fixed later, it
+  #   is the cost of fail-fast, accepted deliberately. The alternative is an application that starts
+  #   happily while retrieving from a space its queries no longer live in — which returns confident,
+  #   ranked, meaningless results and raises no error anywhere. A refused boot is loud; that failure
+  #   is silent, and silent is the one AURA has already been bitten by (the Day 12 cross-model lab).
+  canary:
+    enabled: true
+    # The canary chunk, addressed by the identity kb_chunks already declares unique. NOT by uuid:
+    # KbCorpusLoader assigns a random one per ingest, so a uuid-pinned canary would fail on every
+    # reload for the one reason it is not meant to detect.
+    source-doc: refund-policy.md
+    chunk-index: 0
+    # MEASURED 2026-08-04 by CanaryBandHarnessIT. n=20 fresh voyage-4-lite/query embeddings of the
+    # canary chunk's exact embedding input, each compared by Postgres against the stored
+    # voyage-4-large/document vector:
+    #
+    #   min=0.24288794  max=0.24363139  mean=0.24342135  spread=0.00074345
+    #
+    # Rule, PRE-REGISTERED before any of those numbers existed and not adjusted afterwards:
+    #   band = [ min - 0.5*(max-min),  max + 0.5*(max-min) ]
+    #
+    # An observation, recorded rather than acted on: the spread is ~0.0007, so this band is extremely
+    # tight — Voyage is very nearly deterministic for a fixed input. That makes the guard a precise
+    # detector of the thing it is for (a model swap, a lane flip, a corpus re-embedded under a
+    # different model) and also means it WILL trip if Voyage silently updates either model behind a
+    # stable name. That is the correct outcome, not a false positive: a provider-side model change is
+    # exactly the event that invalidates a stored corpus, and it is precisely the change that
+    # otherwise arrives with no signal at all.
+    #
+    # If this band ever needs to change, the way to change it is to re-run the harness and paste the
+    # new numbers — never to widen these by hand. A hand-widened band is a band with no rule behind
+    # it, and its width then encodes nothing except how annoyed someone was that morning.
+    band:
+      min-distance: 0.242516
+      max-distance: 0.244003
+    store-probe:
+      # OFF. Enable when a canary trip needs self-diagnosis: this probe re-embeds the canary on the
+      # DOCUMENT lane and measures fresh-vs-stored within one model, which isolates the store's side
+      # of the pairing. Near zero => the corpus and the document model are intact, so the trip came
+      # from the query lane. Clearly non-zero => the stored vectors themselves have gone stale.
+      # It costs a premium-model embedding on every boot, which is why it is not left on.
+      enabled: false
 
 # --- Day 12: Voyage embeddings + chunking ------------------------------------------------------
 # Top-level (not under aura.*) because this is a second EXTERNAL dependency's transport config, the

@@ -6,6 +6,7 @@ import okhttp3.mockwebserver.QueueDispatcher;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.aura.aura.client.VoyageEmbeddingClient;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
@@ -13,6 +14,7 @@ import org.springframework.http.HttpStatusCode;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.client.RestClient;
 import org.springframework.test.context.ActiveProfiles;
+import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.testcontainers.junit.jupiter.Container;
@@ -24,6 +26,8 @@ import java.io.IOException;
 import static org.aura.aura.AnthropicMessages.classifierOk;
 import static org.aura.aura.AnthropicMessages.resolve;
 import static org.aura.aura.AnthropicMessages.resolverOk;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.when;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
@@ -36,7 +40,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @ActiveProfiles({"test", "it"})
 @Testcontainers
-class RedisDegradationIT {
+// Day 14: full application context, so it needs a Postgres (see PostgresBackedContext).
+class RedisDegradationIT extends PostgresBackedContext {
 
     // OWN container — stopped mid-test below. @ServiceConnection auto-wires spring.data.redis.* to it.
     @Container
@@ -70,8 +75,15 @@ class RedisDegradationIT {
     private static final String TICKET = "cache-death";
     private static final String MESSAGE = "How long does standard shipping take to Oregon?";
 
+    // Day 14: same reason as AnthropicTransportIT — /resolve now embeds the ticket first, and the only
+    // fake server here is the Anthropic one. See that class for the full note.
+    @MockitoBean VoyageEmbeddingClient voyage;
+
     @BeforeEach
     void setup() {
+        // Full width — see the note in AnthropicTransportIT: the Postgres is shared, so a short vector
+        // is a dimension error waiting on whichever class seeded rows first.
+        when(voyage.embedQuery(anyString())).thenReturn(queryVector());
         rest = RestClient.builder()
                 .baseUrl("http://localhost:" + port)
                 .defaultStatusHandler(HttpStatusCode::isError, (req, res) -> { })

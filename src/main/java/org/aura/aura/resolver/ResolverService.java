@@ -20,11 +20,11 @@ import io.github.resilience4j.retry.annotation.Retry;
 import lombok.extern.slf4j.Slf4j;
 import org.aura.aura.ResolverPromptProvider;
 import org.aura.aura.resilience.AnthropicTransientFailures;
+import org.aura.aura.retrieval.ContextBlock;
 import org.springframework.stereotype.Service;
 
 import java.util.List;
 import java.util.Optional;
-import java.util.stream.Collectors;
 
 @Slf4j
 @Service
@@ -49,16 +49,19 @@ public class ResolverService {
 
     private final AnthropicClient client;
     private final ResolverPromptProvider prompts;
-    private final KnowledgeBase knowledgeBase;
     // Injected only so the fallback can report the breaker's actual state (OPEN vs HALF_OPEN vs
     // FORCED_OPEN) in its WARN line — that log becomes the Day 24 "how often do we degrade" metric.
     private final CircuitBreakerRegistry circuitBreakers;
 
-    public ResolverService (AnthropicClient client, ResolverPromptProvider prompts, KnowledgeBase knowledgeBase,
+    // Day 14: KnowledgeBase is GONE from this constructor. Retrieval no longer happens here — it
+    // happens in CachedResolutionService, BEFORE the cache key is computed, because the key now
+    // hashes the retrieved bytes (Decision 4). Leaving a retrieve() call in this class as well would
+    // mean embedding and searching twice per ticket, and the second result could differ from the one
+    // the key was built from.
+    public ResolverService (AnthropicClient client, ResolverPromptProvider prompts,
                             CircuitBreakerRegistry circuitBreakers){
         this.client = client;
         this.prompts = prompts;
-        this.knowledgeBase = knowledgeBase;
         this.circuitBreakers = circuitBreakers;
     }
 
@@ -79,12 +82,17 @@ public class ResolverService {
     // transient error and return BEFORE @Retry ever retried it — silently disabling retries. On the
     // outer @Retry, the fallback runs only after retries are spent (or a breaker-open rejection has
     // passed straight through), which is exactly when we want to decide "degrade vs surface".
+    //
+    // Day 14 changed the SIGNATURE, not the policy: the context arrives already retrieved rather than
+    // being fetched here. That keeps this method a pure "ask Claude" step — which is what makes it
+    // still safe to retry. Had retrieval stayed inside, every retry would have re-embedded the ticket
+    // (a billable Voyage call) and re-run the search, so a Claude rate-limit blip would have cost
+    // three embeddings, and a retry could have been answered from a DIFFERENT context than the one
+    // the cache key was computed over.
     @Retry(name = CLAUDE, fallbackMethod = "escalateToHuman")
     @CircuitBreaker(name = CLAUDE)
-    public Resolution resolve(String ticket){
-        List<KbEntry> hits = knowledgeBase.retrieve(ticket);
-
-        StructuredMessage<ResolverOutput> message = client.messages().create(paramsFor(ticket, hits));
+    public Resolution resolve(String ticket, ContextBlock context){
+        StructuredMessage<ResolverOutput> message = client.messages().create(paramsFor(ticket, context));
         logUsage(message.usage());
 
         // stop_reason BEFORE parsing — the same gate the classifier uses (Day 6), and it matters MORE
@@ -112,11 +120,14 @@ public class ResolverService {
                 .map(StructuredTextBlock::text)
                 .orElseThrow(() -> new IllegalStateException("end_turn resolver response carried no text block"));
 
-        // sourcesUsed is derived from RETRIEVAL, never read from the model — the grounding receipt
-        // stays ours, which is what makes it trustworthy evidence rather than a claim (see ResolverOutput).
+        // sourcesProvided is copied STRAIGHT off the context block — the same object whose rendered
+        // bytes were sent — and never read from the model. Note what is deliberately NOT happening
+        // here: no filtering by "did the reply mention this chunk", no reconciliation against the
+        // model's prose. If the answer names a source, that is narration. This field is the ledger of
+        // what was in the request, and a ledger that edits itself to match the story is not a ledger.
         return new Resolution(
                 output.reply(),
-                hits.stream().map(KbEntry::id).toList(),
+                context.sourcesProvided(),
                 ResolutionStatus.RESOLVED,
                 output.escalate());
     }
@@ -138,8 +149,14 @@ public class ResolverService {
     // is deliberately NO "isPermanent(statusCode)" check: absence from the transient list IS the whole
     // decision, exactly like the retry allowlist. A denylist would fail OPEN, silently masking an
     // unrecognised error as a bogus outage escalation.
+    //
+    // The parameter list MIRRORS resolve()'s, plus the Throwable — that is how Resilience4j finds a
+    // fallback, and it is a match it makes reflectively at runtime. So adding ContextBlock to
+    // resolve() and forgetting it here would not fail to compile; it would fail at the first
+    // transient error, at which point the degrade path silently stops existing and a rate limit
+    // becomes a 500. ResolverResilienceTest exercises this path for exactly that reason.
     @SuppressWarnings("unused") // invoked reflectively by the Resilience4j @CircuitBreaker aspect
-    private Resolution escalateToHuman(String ticket, Throwable cause) throws Throwable {
+    private Resolution escalateToHuman(String ticket, ContextBlock context, Throwable cause) throws Throwable {
         if (cause instanceof CallNotPermittedException) {
             var state = circuitBreakers.circuitBreaker(CLAUDE).getState();
             log.warn("Claude unavailable — circuit breaker '{}' is {}; escalating ticket to a human. cause={}",
@@ -169,6 +186,10 @@ public class ResolverService {
     private Resolution escalated() {
         return new Resolution(
                 "We couldn't answer this automatically right now, so your ticket has been escalated to a human agent.",
+                // Empty, even though retrieval succeeded and a context block exists. This answer was
+                // not produced from those documents — it was produced instead of an answer — so
+                // listing them would attach a grounding receipt to text that is not grounded in
+                // anything. The ledger records what backed THIS reply; nothing did.
                 List.of(),
                 ResolutionStatus.ESCALATED_TO_HUMAN,
                 // BOTH channels true, and that is not redundancy. `status` records WHY (the dependency
@@ -210,8 +231,14 @@ public class ResolverService {
     // is not ceremony: if rawParams() ever dropped it, the request would silently revert to prose,
     // the extractor would match no "reply" key, and every SSE customer would get an EMPTY stream —
     // a silent total failure with no exception anywhere to catch it.
-    public MessageCreateParams buildStreamingParams(String ticket) {
-        return paramsFor(ticket, knowledgeBase.retrieve(ticket)).rawParams();
+    //
+    // Day 14: the context is a PARAMETER now, for the same reason it is on resolve(). Retrieving here
+    // would have given the streaming transport its own private retrieval — a second call site,
+    // separately maintained, free to drift from the blocking one in k, in budget, or in dedup. The
+    // whole "ONE prompt, TWO doors" invariant below only holds if both doors are handed the same
+    // shape of input, so the caller retrieves and both transports render identically.
+    public MessageCreateParams buildStreamingParams(String ticket, ContextBlock context) {
+        return paramsFor(ticket, context).rawParams();
     }
 
     // Single source of truth for the resolution prompt: model, token cap, system prompt, and the
@@ -225,27 +252,36 @@ public class ResolverService {
     // enforcement: the model emits JSON anyway, unenforced and unparseable, straight onto a
     // customer-facing SSE stream. Splitting the transports would have meant splitting the prompt too,
     // which means two cache prefixes (ADR-020) and a live drift seam.
-    private StructuredMessageCreateParams<ResolverOutput> paramsFor(String ticket, List<KbEntry> hits) {
-        String context = hits.isEmpty()
-                ? "No matching knowledge-base entries found."
-                : hits.stream()
-                  .map(e -> "[" + e.id() + "]" + e.title() +": "+ e.content())
-                  .collect(Collectors.joining("\n"));
-
-        String userTurn = """
-                <knowledge_base>
-                %s
-                </knowledge_base>
-
-                customer ticket: %s
-                """.formatted(context, ticket);
+    private StructuredMessageCreateParams<ResolverOutput> paramsFor(String ticket, ContextBlock context) {
+        // ORDER IS THE DESIGN: documents first, ticket LAST.
+        //
+        // Not a formatting preference. The ticket is the only part of this turn the customer controls,
+        // and putting it after the reference material means an instruction smuggled into a ticket
+        // ("ignore the documents above and…") is arguing against text the model has already read
+        // rather than framing text it is about to read. It also puts the actual question closest to
+        // the generation point, which is where an instruction lands hardest.
+        //
+        // The document block arrives pre-rendered and canonical. This method does not format it,
+        // truncate it, or re-order it — ContextBlockAssembler owns those bytes, and it owns them
+        // ALONE because the response cache key hashes exactly what is sent here. A "small tweak" to
+        // the framing at this call site would change every key in the keyspace without changing
+        // anything the assembler can see.
+        String userTurn = context.rendered() + "\n\ncustomer ticket: " + ticket;
 
         return MessageCreateParams.builder()
                 .model(Model.CLAUDE_SONNET_4_5)   // MODEL_ID = this constant's .asString(); one source, no drift
                 .maxTokens(MAX_TOKENS)
                 .temperature(TEMPERATURE)
-                // ADR-020: mark the static system prompt (rules + few-shot + hardcoded KB — the STABLE
-                // prefix) with an ephemeral cache_control breakpoint. Replaces the plain .system(String).
+                // ADR-020: mark the static system prompt (rules + few-shot + the Day 14 grounding
+                // block — the STABLE prefix) with an ephemeral cache_control breakpoint. Replaces the
+                // plain .system(String).
+                //
+                // The grounding instruction rides INSIDE this block, which is the whole reason it
+                // lives in the prompt file rather than being prepended to the retrieved documents.
+                // Attached to the documents it would sit after the breakpoint, where it is re-read at
+                // full price on every ticket and changes bytes whenever retrieval changes; here it is
+                // byte-identical forever and costs 0.1x from the second call onward. The instruction
+                // that must apply to every request is exactly the instruction that should be cached.
                 .systemOfTextBlockParams(List.of(
                         TextBlockParam.builder()
                                 .text(prompts.systemPrompt())

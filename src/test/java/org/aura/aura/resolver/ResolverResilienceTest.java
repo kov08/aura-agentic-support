@@ -13,6 +13,8 @@ import com.anthropic.models.messages.StructuredMessageCreateParams;
 import com.anthropic.models.messages.TextBlock;
 import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry;
 import org.aura.aura.ResolverPromptProvider;
+import org.aura.aura.retrieval.ContextBlock;
+import org.aura.aura.retrieval.SourceRef;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -26,6 +28,7 @@ import org.springframework.test.context.TestPropertySource;
 
 import java.util.List;
 import java.util.Optional;
+import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -64,12 +67,24 @@ class ResolverResilienceTest {
 
     private static final String TICKET = "How long do I have to return something?";
 
+    // A fixed, already-retrieved context. These tests are about TRANSPORT health, so retrieval is a
+    // constant here rather than a moving part — which is precisely the separation that moving
+    // retrieval out of ResolverService bought.
+    private static final ContextBlock CONTEXT = new ContextBlock(
+            "<documents>\n<document id=\"c1\" breadcrumb=\"Refund Policy\">\n30 days\n</document>\n</documents>",
+            List.of(new SourceRef(UUID.fromString("00000000-0000-0000-0000-0000000000aa"),
+                    "Refund Policy", 0.19)));
+
     @Configuration(proxyBeanMethods = false)
     // pulls in Resilience4j + Spring AOP autoconfiguration, and application.yml binding. The exclusion
     // is Day 13: this slice does not use a database, and it activates no profile, so it cannot inherit
     // application-test.yml's exclusion — see ClassificationResilienceTest for the same note.
     @EnableAutoConfiguration(exclude = DataSourceAutoConfiguration.class)
-    @Import({ResolverService.class, ResolverPromptProvider.class, HardcodedKnowledgeBase.class})
+    // Day 14: HardcodedKnowledgeBase is gone from this slice — retrieval no longer happens inside
+    // ResolverService, so the policy under test now wraps a pure "ask Claude" call. That is not the
+    // test being simplified, it is the property being preserved: a retry must not re-run a billable
+    // embedding, and every attempt must ask about the SAME context it started with.
+    @Import({ResolverService.class, ResolverPromptProvider.class})
     static class ResilienceTestConfig {
         // The one external dependency is faked. Deep stubs let client.messages().create(...) be stubbed
         // without naming the intermediate service type. Autowired into the test as the SAME instance.
@@ -107,13 +122,16 @@ class ResolverResilienceTest {
                 .thenThrow(rateLimited())
                 .thenReturn(okResponse());
 
-        Resolution resolution = resolver.resolve(TICKET);
+        Resolution resolution = resolver.resolve(TICKET, CONTEXT);
 
         // Succeeded on the third attempt: a normal, grounded RESOLVED answer — NOT an escalation.
         assertThat(resolution.status()).isEqualTo(ResolutionStatus.RESOLVED);
         // BOTH channels agree it is a clean answer: healthy dependency, and no model-chosen handoff.
         assertThat(resolution.escalate()).isFalse();
-        assertThat(resolution.sourcesUsed()).containsExactly("kb-returns");
+        // The ledger is the context handed in, carried through a successful retry unchanged.
+        assertThat(resolution.sourcesProvided())
+                .extracting(SourceRef::breadcrumb)
+                .containsExactly("Refund Policy");
         // The retry actually re-called Claude: 1 original + 2 retries = 3 (max-attempts is a total).
         verify(client.messages(), times(3)).create(any(StructuredMessageCreateParams.class));
     }
@@ -127,7 +145,7 @@ class ResolverResilienceTest {
 
         // Propagates (does not get swallowed into a bogus escalation) — the fallback is typed to the
         // breaker-open exception only, so a permanent error flows straight through to the caller.
-        assertThatThrownBy(() -> resolver.resolve(TICKET))
+        assertThatThrownBy(() -> resolver.resolve(TICKET, CONTEXT))
                 .isInstanceOf(BadRequestException.class);
 
         verify(client.messages(), times(1)).create(any(StructuredMessageCreateParams.class));
@@ -144,7 +162,7 @@ class ResolverResilienceTest {
                 .thenThrow(rateLimited())
                 .thenThrow(rateLimited());
 
-        Resolution resolution = resolver.resolve(TICKET);
+        Resolution resolution = resolver.resolve(TICKET, CONTEXT);
 
         assertThat(resolution.status()).isEqualTo(ResolutionStatus.ESCALATED_TO_HUMAN);
         // The fallback sets BOTH channels: status says WHY (dependency unhealthy), escalate says WHAT
@@ -161,7 +179,7 @@ class ResolverResilienceTest {
     void fallsBackToHumanEscalationWhenCircuitOpen() {
         circuitBreakers.circuitBreaker("anthropicApi").transitionToOpenState();
 
-        Resolution resolution = resolver.resolve(TICKET);
+        Resolution resolution = resolver.resolve(TICKET, CONTEXT);
 
         assertThat(resolution.status()).isEqualTo(ResolutionStatus.ESCALATED_TO_HUMAN);
         assertThat(resolution.escalate()).isTrue();

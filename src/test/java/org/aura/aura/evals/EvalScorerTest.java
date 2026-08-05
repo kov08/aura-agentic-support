@@ -8,9 +8,11 @@ import org.aura.aura.classification.TicketIntent;
 import org.aura.aura.classification.TicketUrgency;
 import org.aura.aura.resolver.Resolution;
 import org.aura.aura.resolver.ResolutionStatus;
+import org.aura.aura.retrieval.SourceRef;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
+import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -50,8 +52,20 @@ class EvalScorerTest {
         return classified(TicketCategory.RETURNS_AND_REFUNDS, TicketUrgency.MEDIUM, TicketIntent.GET_INFORMATION);
     }
 
+    /**
+     * Day 14: the tests below still speak in citation LABELS ("kb-returns"), because the scoring rules
+     * they pin — subset semantics, the strict empty-label case, extras as warnings — are about set
+     * arithmetic and have nothing to do with what a citation is called. Only this fixture changed: a
+     * label becomes the breadcrumb of a {@link SourceRef}, which is the identifier
+     * {@link EvalScorer#citedBreadcrumbs} grades against.
+     *
+     * <p>The uuid and distance are filler here for the same reason: the scorer never reads them.
+     */
     private static Resolution resolved(String reply, List<String> sources, boolean escalate) {
-        return new Resolution(reply, sources, ResolutionStatus.RESOLVED, escalate);
+        return new Resolution(
+                reply,
+                sources.stream().map(s -> new SourceRef(UUID.randomUUID(), s, 0.2)).toList(),
+                ResolutionStatus.RESOLVED, escalate);
     }
 
     // ---- happy path -----------------------------------------------------------------------------

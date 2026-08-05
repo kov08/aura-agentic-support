@@ -4,6 +4,7 @@ import org.aura.aura.classification.ClassificationResult;
 import org.aura.aura.classification.ReviewReason;
 import org.aura.aura.resolver.Resolution;
 import org.aura.aura.resolver.ResolutionStatus;
+import org.aura.aura.retrieval.SourceRef;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -30,6 +31,30 @@ public final class EvalScorer {
     // reads in context instead of as a bare fragment.
     private static final int CONTEXT_RADIUS = 30;
 
+    /**
+     * The citation identifiers the sources dimension is graded against: breadcrumbs.
+     *
+     * <h2>Day 14, and a KNOWN-STALE label set</h2>
+     * Through Day 13 a resolution's sources were hardcoded knowledge-base ids — {@code "kb-returns"},
+     * {@code "kb-shipping"} — and {@code golden-set-v2.json}'s {@code expectedSources} labels name
+     * exactly those. Those ids no longer exist anywhere: retrieval returns real chunks now, identified
+     * by a uuid and a breadcrumb.
+     *
+     * <p>The uuid is not a usable label — {@code KbCorpusLoader} assigns a fresh random one on every
+     * ingest, so a golden set pinned to uuids would go stale on every reload. The breadcrumb
+     * ({@code "Refund Policy > Standard Refund Window"}) is stable across re-ingestion, human-readable,
+     * and is what a labeller can actually write down, so it is the identifier the dimension now uses.
+     *
+     * <p><b>CONSEQUENCE, stated rather than discovered on the next eval run:</b> every golden-set
+     * ticket whose {@code expectedSources} is a non-empty list of {@code kb-*} ids will FAIL the
+     * sources dimension until the labels are rewritten as breadcrumbs. That relabelling is deliberately
+     * not done here — it is a MEASUREMENT decision that needs a run against the real corpus. The other
+     * dimensions (classifier, escalate, mustContain, mustNotContain) are unaffected.
+     */
+    public static List<String> citedBreadcrumbs(Resolution resolution) {
+        return resolution.sourcesProvided().stream().map(SourceRef::breadcrumb).toList();
+    }
+
     public TicketScore score(EvalTicket ticket, ClassificationResult classification, Resolution resolution) {
         ExpectedResult expected = ticket.expected();
 
@@ -54,7 +79,7 @@ public final class EvalScorer {
         List<TicketScore.RuleViolation> mustNotViolations = List.of();
         if (!resolverDegraded) {
             escalateMatch = expected.escalate() == resolution.escalate();
-            sources = gradeSources(expected.expectedSources(), resolution.sourcesUsed());
+            sources = gradeSources(expected.expectedSources(), citedBreadcrumbs(resolution));
             String reply = resolution.answer();
             mustContainMisses = missingRequired(expected.mustContain(), reply);
             mustNotViolations = forbiddenPresent(expected.mustNotContain(), reply);
