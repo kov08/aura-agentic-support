@@ -3,6 +3,8 @@ package org.aura.aura.resolver;
 import org.aura.aura.ResolverPromptProvider;
 import org.aura.aura.cache.CacheKeyFactory;
 import org.aura.aura.cache.ResolutionCache;
+import org.aura.aura.client.VoyagePermanentException;
+import org.aura.aura.client.VoyageTransientException;
 import org.aura.aura.retrieval.ContextBlock;
 import org.aura.aura.retrieval.RetrievalService;
 import org.aura.aura.retrieval.SourceRef;
@@ -13,12 +15,14 @@ import org.mockito.InOrder;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.dao.DataAccessResourceFailureException;
 
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyDouble;
 import static org.mockito.ArgumentMatchers.anyInt;
@@ -175,6 +179,78 @@ class CachedResolutionServiceTest {
 
         assertThat(result).isSameAs(escalating);
         verify(cache).put(KEY, escalating);
+    }
+
+    // ---------------------------------------------------------------- Decision 5: retrieval degrades
+
+    // POLICY: a retrieval dependency that is unwell degrades to a human, exactly as an unwell Claude
+    // does. Before this, the same customer got a 200 + handoff when Anthropic was rate-limited and a
+    // 500 when Voyage was — one outage, two experiences, decided by which service happened to break.
+    @Test
+    void aVoyageFailureWithRetriesSpentEscalatesInsteadOfPropagating() {
+        when(retrieval.retrieve(TICKET))
+                .thenThrow(new VoyageTransientException("Voyage transient failure: HTTP 429 on voyage-4-lite"));
+
+        Resolution result = service.resolve(REQUEST);
+
+        assertThat(result.status()).isEqualTo(ResolutionStatus.ESCALATED_TO_HUMAN);
+        // BOTH channels, so a caller reading only `escalate` still routes correctly during an outage.
+        assertThat(result.escalate()).isTrue();
+        // No documents reached the model, so the receipt is honestly empty rather than listing the
+        // context this request never obtained.
+        assertThat(result.sourcesProvided()).isEmpty();
+    }
+
+    @Test
+    void aRetrievalFailureNeverReachesTheResolverAndNeverWritesToRedis() {
+        when(retrieval.retrieve(TICKET)).thenThrow(new VoyageTransientException("429"));
+
+        service.resolve(REQUEST);
+
+        // The resolver is untouched: there is no context to ask about, and paying Sonnet to answer
+        // from nothing would be worse than escalating.
+        verifyNoInteractions(resolver);
+        // Nothing is written — and nothing is READ either. Both are structural rather than
+        // conditional: the key is a hash OF the retrieved bytes, so when retrieval fails there is no
+        // key. A future edit cannot invert a conditional that does not exist.
+        verifyNoInteractions(cache);
+        verifyNoInteractions(keys);
+    }
+
+    @Test
+    void anUnreachableDatabaseAlsoEscalates() {
+        // Postgres is the other retrieval dependency, and "the store did not answer" is the same
+        // class of event as "the embedding provider did not answer".
+        when(retrieval.retrieve(TICKET))
+                .thenThrow(new DataAccessResourceFailureException("connection refused"));
+
+        assertThat(service.resolve(REQUEST).status()).isEqualTo(ResolutionStatus.ESCALATED_TO_HUMAN);
+    }
+
+    // POLICY: fail-closed. Absence from the allowlist IS the decision, exactly as in the resolver's
+    // fallback. A 401 from Voyage is a bad API key — OUR misconfiguration — and masking it as an
+    // outage would let a broken deployment escalate every ticket to a human while looking healthy.
+    @Test
+    void aPermanentVoyageFailureSurfacesRatherThanMasqueradingAsAnOutage() {
+        when(retrieval.retrieve(TICKET))
+                .thenThrow(new VoyagePermanentException("Voyage permanent failure: HTTP 401"));
+
+        assertThatThrownBy(() -> service.resolve(REQUEST))
+                .isInstanceOf(VoyagePermanentException.class)
+                .hasMessageContaining("401");
+
+        verifyNoInteractions(resolver);
+    }
+
+    @Test
+    void anUnknownRetrievalFailureSurfacesUnwrapped() {
+        // The catch has to be broad to observe anything at all; the DECISION is made on type. An
+        // unrecognised failure must leave exactly as it arrived, not wrapped in something that hides
+        // its type from a caller or a log scraper.
+        IllegalStateException ours = new IllegalStateException("a bug of ours");
+        when(retrieval.retrieve(TICKET)).thenThrow(ours);
+
+        assertThatThrownBy(() -> service.resolve(REQUEST)).isSameAs(ours);
     }
 
     // ---------------------------------------------------------------- fixtures

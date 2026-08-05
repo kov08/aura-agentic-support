@@ -34,6 +34,32 @@ public record Resolution(String answer, List<SourceRef> sourcesProvided, Resolut
         return status == ResolutionStatus.ESCALATED_TO_HUMAN;
     }
 
+    /**
+     * The degraded answer, in the ONE wording AURA is allowed to use for it.
+     *
+     * <p>A static factory rather than each degrade path building its own, because as of Day 14 there
+     * are two of them — the resolver's Resilience4j fallback (Claude unhealthy) and
+     * {@code CachedResolutionService}'s retrieval catch (Voyage or Postgres unhealthy, Decision 5) —
+     * and a customer must not be able to tell which dependency failed from the wording of the apology.
+     * Two hand-written strings would drift on the first edit, and the drift would be invisible: both
+     * would still read fine in isolation.
+     *
+     * <p>The source ledger is EMPTY here, always. These answers were produced INSTEAD of an answer,
+     * not from any document — attaching a grounding receipt to one would be claiming evidence for
+     * text that has none.
+     */
+    public static Resolution escalatedToHuman() {
+        return new Resolution(
+                "We couldn't answer this automatically right now, so your ticket has been escalated to a human agent.",
+                List.of(),
+                ResolutionStatus.ESCALATED_TO_HUMAN,
+                // BOTH channels true, and that is not redundancy. `status` records WHY (a dependency
+                // was unhealthy); `escalate` records WHAT the caller must now do (route to a human), so
+                // downstream code reading only `escalate` still behaves correctly during an outage.
+                // No scoring collision with a model-chosen escalate=true: the eval detects these by
+                // status == ESCALATED_TO_HUMAN and excludes them from scores as DEGRADED.
+                true);
+    }
 }
 // Day 6 extends this (category/urgency/intent). Day 24 extends it (tokens/cost/model).
 // Day 8 added `status`: the resolve path can now end in a degraded ESCALATED_TO_HUMAN outcome

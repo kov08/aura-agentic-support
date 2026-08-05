@@ -183,21 +183,13 @@ public class ResolverService {
         throw cause;
     }
 
+    // Delegates to the shared factory (Day 14): CachedResolutionService's retrieval catch produces the
+    // same degraded answer for a different unhealthy dependency, and the customer must not be able to
+    // tell the two apart from the wording. Note the empty source ledger it returns is correct here
+    // even though retrieval SUCCEEDED and a context block exists — this reply was produced instead of
+    // an answer, not from those documents.
     private Resolution escalated() {
-        return new Resolution(
-                "We couldn't answer this automatically right now, so your ticket has been escalated to a human agent.",
-                // Empty, even though retrieval succeeded and a context block exists. This answer was
-                // not produced from those documents — it was produced instead of an answer — so
-                // listing them would attach a grounding receipt to text that is not grounded in
-                // anything. The ledger records what backed THIS reply; nothing did.
-                List.of(),
-                ResolutionStatus.ESCALATED_TO_HUMAN,
-                // BOTH channels true, and that is not redundancy. `status` records WHY (the dependency
-                // was unhealthy); `escalate` records WHAT the caller must now do (route to a human), so
-                // downstream code reading only `escalate` still behaves correctly during an outage.
-                // No scoring collision with a model-chosen escalate=true: the eval detects these by
-                // status == ESCALATED_TO_HUMAN and excludes them from scores as DEGRADED.
-                true);
+        return Resolution.escalatedToHuman();
     }
 
     // ADR-020: prompt-cache observability. cacheReadInputTokens > 0 means the static system-prompt

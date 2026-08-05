@@ -1,11 +1,15 @@
 package org.aura.aura.resolver;
 
+import lombok.extern.slf4j.Slf4j;
 import org.aura.aura.ResolverPromptProvider;
 import org.aura.aura.cache.CacheKeyFactory;
 import org.aura.aura.cache.ResolutionCache;
+import org.aura.aura.client.VoyageTransientException;
 import org.aura.aura.retrieval.ContextBlock;
 import org.aura.aura.retrieval.RetrievalService;
 import org.aura.aura.web.dto.ResolveTicketRequest;
+import org.springframework.dao.DataAccessResourceFailureException;
+import org.springframework.dao.QueryTimeoutException;
 import org.springframework.stereotype.Service;
 
 import java.util.Optional;
@@ -13,6 +17,7 @@ import java.util.Optional;
 // ADR-018: cache-aside in front of the resolver. The prompt's "TicketResolutionService" is AURA's
 // ResolverService; "TicketRequest" is ResolveTicketRequest; the cached "ResolutionResponse" is the
 // domain Resolution.
+@Slf4j
 @Service
 public class CachedResolutionService {
 
@@ -57,12 +62,14 @@ public class CachedResolutionService {
         // Day 9 is gone and nobody should be surprised by it later.
         //
         // WHAT THIS ALSO CHANGES: retrieval sits OUTSIDE the Resilience4j stack, which only wraps
-        // resolver.resolve. So a Voyage or Postgres failure now propagates as a 5xx rather than
-        // degrading to the ADR-014 human escalation — including on tickets that would have been cache
-        // hits. Flagged, not fixed: giving retrieval its own fallback is a real design decision about
-        // whether an ungrounded answer beats no answer, and it deserves its own day rather than being
-        // smuggled in here.
-        ContextBlock context = retrieval.retrieve(ticketText);
+        // resolver.resolve — so an unhealthy Voyage or Postgres would surface as a 5xx rather than as
+        // the ADR-014 human escalation. Decision 5 closes that, in degradeOnRetrievalFailure below.
+        ContextBlock context;
+        try {
+            context = retrieval.retrieve(ticketText);
+        } catch (Exception failure) {
+            return degradeOnRetrievalFailure(failure);
+        }
 
         String key = keys.resolutionKey(
                 ResolverService.MODEL_ID,
@@ -96,4 +103,63 @@ public class CachedResolutionService {
         return fresh;
     }
 
+    /**
+     * DECISION 5 — retrieval is a dependency too, so it degrades like one.
+     *
+     * <p>Day 8 established the law for Claude: degrade on the DEPENDENCY's problems, fail loud on
+     * OURS. Retrieval added two more dependencies to the request path — Voyage and Postgres — and
+     * until now they had no such treatment, so a rate-limited embedding call turned a ticket into a
+     * 500 while the identical failure one layer down turned it into a human handoff at HTTP 200. Same
+     * customer, same kind of outage, two different experiences, decided by which service happened to
+     * be unhealthy. A human agent is a better outcome than an error page in both cases.
+     *
+     * <h2>ALLOWLIST, not a denylist — the same taxonomy, one layer up</h2>
+     * Only failures that mean "a dependency is unwell" degrade:
+     *
+     * <ul>
+     *   <li>{@link VoyageTransientException} — 429/5xx/socket timeout with the retry budget spent.
+     *       The embedding provider is having a bad minute.</li>
+     *   <li>{@link DataAccessResourceFailureException} — Postgres unreachable. Spring files
+     *       "cannot get a connection" under NonTransient, which is a naming quirk rather than a
+     *       judgement: from here it is exactly "the store did not answer".</li>
+     *   <li>{@link QueryTimeoutException} — it answered, too slowly.</li>
+     * </ul>
+     *
+     * <p>Everything else RETHROWS, and the omissions are deliberate. A
+     * {@code VoyagePermanentException} is a 400/401/422 — a bad API key or a malformed request, which
+     * is OUR bug, and masking it as an outage would let a misconfigured deployment escalate every
+     * single ticket to a human while reporting itself healthy. A {@code BadSqlGrammarException} is
+     * likewise ours. Absence from the list IS the decision, exactly as in
+     * {@code ResolverService.escalateToHuman}: unknown fails closed, and closed here means "surface
+     * it".
+     *
+     * <h2>Nothing is written to Redis on this path, and not because we remembered</h2>
+     * The key is a hash OF the retrieved bytes (Decision 4), so when retrieval fails there is no key
+     * to write under. The cache is not skipped by a conditional that a later edit could invert — it
+     * is unreachable. That is a stronger guarantee than the {@code isEscalatedFallback} gate below,
+     * and it is worth having, because caching an availability answer would keep escalating tickets
+     * for a full TTL after the dependency recovered.
+     */
+    private Resolution degradeOnRetrievalFailure(Exception failure) {
+        boolean dependencyUnhealthy = failure instanceof VoyageTransientException
+                || failure instanceof DataAccessResourceFailureException
+                || failure instanceof QueryTimeoutException;
+
+        if (!dependencyUnhealthy) {
+            // Rethrow unwrapped. The catch had to be broad to see anything at all; the DECISION is
+            // made here, on type, and an unrecognised failure leaves exactly as it arrived.
+            throw failure instanceof RuntimeException runtime
+                    ? runtime
+                    : new IllegalStateException("retrieval failed", failure);
+        }
+
+        // The meter. One line, one distinct message, deliberately shaped like the resolver's two
+        // degrade logs so Day 24 can count all three as separate causes of the same customer outcome
+        // — "how often do we degrade, and which dependency did it".
+        log.warn("retrieval unavailable — escalating ticket to a human. dependency={}, cause={}",
+                failure instanceof VoyageTransientException ? "voyage" : "postgres",
+                failure.toString(), failure);
+
+        return Resolution.escalatedToHuman();
+    }
 }

@@ -8,6 +8,7 @@ import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.aura.aura.client.VoyageEmbeddingClient;
+import org.aura.aura.client.VoyageTransientException;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -162,6 +163,35 @@ class AnthropicTransportIT extends PostgresBackedContext {
         // 4 = classifier(1) + resolver attempts [429, 429, 200]. The retry is proven by a COUNT of
         // requests received, NEVER by an elapsed duration.
         assertThat(ANTHROPIC.getRequestCount() - before).isEqualTo(4);
+    }
+
+    /**
+     * Decision 5 at the HTTP edge: an unhealthy RETRIEVAL dependency degrades exactly like an
+     * unhealthy Claude — 200 with an escalation, not a 500.
+     *
+     * <p>It lives beside {@code it3_budgetExhausted_escalates_http200} on purpose, because the pair is
+     * the whole point. Before Day 14 those two outages produced different customer experiences for no
+     * reason a customer could understand: 200-and-a-handoff when Anthropic was rate-limited, a 500
+     * when Voyage was. Same class of event, same correct answer — a human.
+     *
+     * <p>The classifier response is still enqueued and still consumed: classification precedes
+     * resolution and is unaffected by retrieval being down. Nothing is enqueued for the resolver,
+     * which is the assertion in disguise — this scenario must never reach Claude at all.
+     */
+    @Test
+    void it2b_retrievalUnavailable_escalates_http200_withoutCallingClaude() {
+        when(voyage.embedQuery(anyString()))
+                .thenThrow(new VoyageTransientException("Voyage transient failure: HTTP 429 on voyage-4-lite"));
+        ANTHROPIC.enqueue(classifierOk());
+        int before = ANTHROPIC.getRequestCount();
+
+        ResponseEntity<String> resp = resolve(rest, "it2b", "Retrieval unavailable scenario ticket");
+
+        assertThat(resp.getStatusCode().value()).isEqualTo(200);
+        assertThat(field(resp, "outcome")).isEqualTo("ESCALATED_TO_HUMAN");
+        // ONE request: the classifier. Paying Sonnet to answer a grounded question with no documents
+        // would be spending money to produce a worse answer than the escalation.
+        assertThat(ANTHROPIC.getRequestCount() - before).isEqualTo(1);
     }
 
     @Test
