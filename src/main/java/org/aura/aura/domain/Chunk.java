@@ -31,6 +31,19 @@ public record Chunk(String text, String breadcrumb, String sourceDoc, int positi
      * line from the text — that removal and this restoration are two halves of one decision.
      */
     public String embeddingInput() {
+        return embeddingInput(breadcrumb, text);
+    }
+
+    /**
+     * The concatenation itself, reachable without a {@code Chunk} in hand.
+     *
+     * <p>Day 14 needed it: the canary re-embeds a STORED chunk, and a stored chunk is a
+     * {@code KbChunk} — a row, not this record. Reconstructing {@code breadcrumb + "\n" + content}
+     * at that call site would have been the exact second definition the instance method above exists
+     * to prevent, and it would have drifted the day someone changed the separator here. So the rule
+     * stands and the method moves: ONE definition, two shapes of caller.
+     */
+    public static String embeddingInput(String breadcrumb, String text) {
         return breadcrumb + "\n" + text;
     }
 }
