@@ -88,7 +88,30 @@ public class VoyageEmbeddingClient {
      */
     @Retry(name = VOYAGE)
     public List<float[]> embedDocuments(List<String> inputs) {
-        return embed(inputs, props.documentModel(), EmbeddingInputType.DOCUMENT);
+        return embed(inputs, props.documentModel(), documentInputType());
+    }
+
+    /**
+     * The {@code input_type} {@link #embedDocuments} actually sends.
+     *
+     * <h2>Why this is a method and not a comment</h2>
+     * Day 14's lane-flip drill caught the canary's failure message asserting {@code /query} while the
+     * client had just sent {@code /document} — because the lane in that message was a literal in a
+     * format string, i.e. a statement of INTENT rather than a report of what happened. A guard whose
+     * diagnosis is a hard-coded belief is a guard that lies in exactly the failure it exists to catch.
+     *
+     * <p>Routing the call above and the caller's report through ONE expression is what fixes that:
+     * flip the constant here and the message flips with it, because there is no second place for the
+     * two to disagree. This is the same one-writer-per-field rule the source ledger follows, applied
+     * to a diagnostic.
+     */
+    public EmbeddingInputType documentInputType() {
+        return EmbeddingInputType.DOCUMENT;
+    }
+
+    /** The {@code input_type} {@link #embedQuery} actually sends — see {@link #documentInputType}. */
+    public EmbeddingInputType queryInputType() {
+        return EmbeddingInputType.QUERY;
     }
 
     /**
@@ -97,7 +120,7 @@ public class VoyageEmbeddingClient {
      */
     @Retry(name = VOYAGE)
     public float[] embedQuery(String query) {
-        return embed(List.of(query), props.queryModel(), EmbeddingInputType.QUERY).getFirst();
+        return embed(List.of(query), props.queryModel(), queryInputType()).getFirst();
     }
 
     private List<float[]> embed(List<String> inputs, String model, EmbeddingInputType inputType) {

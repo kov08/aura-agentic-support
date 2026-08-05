@@ -43,6 +43,24 @@ aura:
     # base-url is injected per-class by the ITs via @DynamicPropertySource (the MockWebServer port);
     # under plain `test` it stays the application.yml default (the SDK endpoint), which is what evals need.
 
+  # Day 14 — the boot canary is OFF under test, and this is a tradeoff being accepted out loud rather
+  # than a convenience.
+  #
+  # The canary's whole job is to make a live Voyage call at startup and refuse to boot when the result
+  # is outside a measured band. Leaving it on here would put that live, billable, network-dependent
+  # call in the boot path of every full-context test — which would make `mvn test` need a real API key
+  # and an internet connection to start a Spring context, and would make the suite fail whenever
+  # Voyage has a bad minute. That is a worse property than the one it would buy.
+  #
+  # What it costs: the canary is never exercised against live Voyage in CI. Its LOGIC — band
+  # comparison, the refuse-to-boot path, the store probe's on/off behaviour — is unit-tested with
+  # fixed vectors and stubbed distances (RetrievalCanaryCheckTest), and the band itself is a measured
+  # artefact produced by CanaryBandHarnessIT, which is manual for the same reasons. So what is
+  # untested in CI is exactly the seam between those two: that a real Voyage call lands inside the
+  # real band. That seam is tested by booting the application, which is the DoD check for the day.
+  canary:
+    enabled: false
+
 # Day 12 — same presence law, second dependency. The @NotBlank on VoyageProperties applies to every
 # context, so a full-context test that never embeds anything still needs a non-blank key.
 # ${VOYAGE_API_KEY:test-key}: the real key when present (SemanticSearchDemoIT under -Pdemo makes live

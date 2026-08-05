@@ -11,6 +11,7 @@ import org.aura.aura.classification.ClassificationResult;
 import org.aura.aura.classification.TicketClassificationService;
 import org.aura.aura.resolver.ResolverOutput;
 import org.aura.aura.resolver.ResolverService;
+import org.aura.aura.retrieval.RetrievalService;
 import org.aura.aura.web.dto.ClassificationResponse;
 import org.aura.aura.web.dto.ResolveTicketRequest;
 import org.springframework.beans.factory.annotation.Qualifier;
@@ -37,6 +38,7 @@ public class TicketStreamingService {
 
     private final AnthropicClient client;
     private final ResolverService resolverService;
+    private final RetrievalService retrievalService;
     private final TicketClassificationService classificationService;
     private final Executor sseExecutor;
     // Boot's configured mapper (same discipline as ResolutionCache) — never `new ObjectMapper()`.
@@ -45,11 +47,13 @@ public class TicketStreamingService {
     public TicketStreamingService(
             AnthropicClient client,
             ResolverService resolverService,
+            RetrievalService retrievalService,
             TicketClassificationService classificationService,
             @Qualifier(StreamingAsyncConfig.SSE_EXECUTOR) Executor sseExecutor,
             ObjectMapper objectMapper) {
         this.client = client;
         this.resolverService = resolverService;
+        this.retrievalService = retrievalService;
         this.classificationService = classificationService;
         this.sseExecutor = sseExecutor;
         this.objectMapper = objectMapper;
@@ -106,7 +110,14 @@ public class TicketStreamingService {
             // (c) Open the streaming resolution call in try-with-resources. close() is what cancels
             //     the upstream generation on ANY exit (normal, error, or client disconnect) — that's
             //     what stops paying for tokens the client will never receive.
-            MessageCreateParams params = resolverService.buildStreamingParams(request.message());
+            //     Day 14: retrieval happens HERE, on the pump thread, and the block is passed in.
+            //     The streaming path deliberately does NOT go through CachedResolutionService (SSE
+            //     response caching is still a parking-lot item), so it owns its own retrieval call —
+            //     but it calls the same RetrievalService with the same k, the same budget and the
+            //     same dedup, so a streamed answer is grounded identically to a blocking one. Only
+            //     the transport differs, which has been the rule for this pair since Day 7.
+            MessageCreateParams params = resolverService.buildStreamingParams(
+                    request.message(), retrievalService.retrieve(request.message()));
             try (StreamResponse<RawMessageStreamEvent> stream = client.messages().createStreaming(params)) {
                 // Iterator, not forEach: send() throws checked IOException, which a Consumer lambda
                 // can't propagate. The explicit loop lets that IOException bubble to the catch below.

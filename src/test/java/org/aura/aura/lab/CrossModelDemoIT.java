@@ -52,7 +52,9 @@ import static org.assertj.core.api.Assertions.assertThat;
 @Tag("manual")
 @ActiveProfiles("test")
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.NONE)
-class CrossModelDemoIT {
+// Day 14: this lab builds its own client and never touches the database, but it loads the FULL
+// application context — which now contains RetrievalService — so it needs one anyway.
+class CrossModelDemoIT extends org.aura.aura.PostgresBackedContext {
 
     private static final String REFUND_QUERY = "Can I get my money back for a hoodie I bought two weeks ago?";
 

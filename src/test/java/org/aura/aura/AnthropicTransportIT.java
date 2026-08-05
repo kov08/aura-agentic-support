@@ -7,6 +7,8 @@ import okhttp3.mockwebserver.QueueDispatcher;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.aura.aura.client.VoyageEmbeddingClient;
+import org.aura.aura.client.VoyageTransientException;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -16,6 +18,7 @@ import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.client.RestClient;
 import org.springframework.test.context.ActiveProfiles;
+import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.testcontainers.junit.jupiter.Container;
@@ -32,6 +35,8 @@ import static org.aura.aura.AnthropicMessages.resolve;
 import static org.aura.aura.AnthropicMessages.resolverOk;
 import static org.aura.aura.AnthropicMessages.resolverOkDelayed;
 import static org.aura.aura.AnthropicMessages.RESOLVER_REPLY;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.when;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
@@ -49,7 +54,12 @@ import static org.assertj.core.api.Assertions.assertThat;
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @ActiveProfiles({"test", "it"})
 @Testcontainers
-class AnthropicTransportIT {
+// Day 14: retrieval is on the request path, so this full application context needs a Postgres. The
+// base class supplies a shared one and undoes the test profile's DataSource exclusion. Note what
+// that means for the scenarios below: a /resolve request now embeds the ticket and searches pgvector
+// BEFORE the Anthropic call this class is about — so the request counts asserted here are still
+// (1 classifier + N resolver attempts) against MockWebServer, because Voyage is not this server.
+class AnthropicTransportIT extends PostgresBackedContext {
 
     // Redis stays UP for this whole class — the Day 9 cache runs for real; this class never kills it
     // (that is RedisDegradationIT's job, on its OWN container). @ServiceConnection auto-wires
@@ -86,8 +96,27 @@ class AnthropicTransportIT {
     @Autowired CircuitBreakerRegistry breakers;
     RestClient rest;
 
+    /**
+     * Day 14: /resolve embeds the ticket before it calls Claude, and this class's MockWebServer is
+     * the ANTHROPIC endpoint — Voyage would be reached for real, with the profile's dummy key, and
+     * every scenario below would fail on a 401 several layers before the transport it is testing.
+     *
+     * <p>Stubbed at the Java boundary rather than given a second MockWebServer, because the retrieval
+     * leg is not what this class is about and a real embedding call would only add a way for these
+     * tests to fail. {@code kb_chunks} is left empty, so retrieval legitimately returns an empty
+     * document block and the request counts below stay exactly what they were: 1 classifier + N
+     * resolver attempts, all against this server.
+     */
+    @MockitoBean VoyageEmbeddingClient voyage;
+
     @BeforeEach
     void isolate() {
+        // FULL WIDTH, not a convenient one-element stub. Learned the hard way: the shared Postgres is
+        // shared with RagResolutionIT, so kb_chunks may hold real vector(1024) rows by the time this
+        // class runs, and `embedding <=> CAST('[1.0]' AS vector)` is a hard Postgres error on a
+        // dimension mismatch — surfacing here as an unexplained 500 in a test about Anthropic. A stub
+        // that ignores a contract the database enforces is a stub that fails in test-ordering roulette.
+        when(voyage.embedQuery(anyString())).thenReturn(queryVector());
         // A RestClient at the running server, whose error handler is a no-op so 4xx/5xx are returned as
         // data (IT-4 inspects the 500 problem detail) rather than thrown.
         rest = RestClient.builder()
@@ -134,6 +163,35 @@ class AnthropicTransportIT {
         // 4 = classifier(1) + resolver attempts [429, 429, 200]. The retry is proven by a COUNT of
         // requests received, NEVER by an elapsed duration.
         assertThat(ANTHROPIC.getRequestCount() - before).isEqualTo(4);
+    }
+
+    /**
+     * Decision 5 at the HTTP edge: an unhealthy RETRIEVAL dependency degrades exactly like an
+     * unhealthy Claude — 200 with an escalation, not a 500.
+     *
+     * <p>It lives beside {@code it3_budgetExhausted_escalates_http200} on purpose, because the pair is
+     * the whole point. Before Day 14 those two outages produced different customer experiences for no
+     * reason a customer could understand: 200-and-a-handoff when Anthropic was rate-limited, a 500
+     * when Voyage was. Same class of event, same correct answer — a human.
+     *
+     * <p>The classifier response is still enqueued and still consumed: classification precedes
+     * resolution and is unaffected by retrieval being down. Nothing is enqueued for the resolver,
+     * which is the assertion in disguise — this scenario must never reach Claude at all.
+     */
+    @Test
+    void it2b_retrievalUnavailable_escalates_http200_withoutCallingClaude() {
+        when(voyage.embedQuery(anyString()))
+                .thenThrow(new VoyageTransientException("Voyage transient failure: HTTP 429 on voyage-4-lite"));
+        ANTHROPIC.enqueue(classifierOk());
+        int before = ANTHROPIC.getRequestCount();
+
+        ResponseEntity<String> resp = resolve(rest, "it2b", "Retrieval unavailable scenario ticket");
+
+        assertThat(resp.getStatusCode().value()).isEqualTo(200);
+        assertThat(field(resp, "outcome")).isEqualTo("ESCALATED_TO_HUMAN");
+        // ONE request: the classifier. Paying Sonnet to answer a grounded question with no documents
+        // would be spending money to produce a worse answer than the escalation.
+        assertThat(ANTHROPIC.getRequestCount() - before).isEqualTo(1);
     }
 
     @Test

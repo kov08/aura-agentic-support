@@ -5,13 +5,15 @@ import com.anthropic.errors.AnthropicServiceException;
 import com.anthropic.models.messages.Message;
 import com.anthropic.models.messages.MessageCreateParams;
 import com.anthropic.models.messages.MessageParam;
+import org.aura.aura.resolver.CachedResolutionService;
 import org.aura.aura.resolver.Resolution;
-import org.aura.aura.resolver.ResolverService;
+import org.aura.aura.web.dto.ResolveTicketRequest;
 import org.springframework.boot.CommandLineRunner;
 import org.springframework.context.annotation.Profile;
 import org.springframework.stereotype.Component;
 
 import java.util.List;
+import java.util.Locale;
 
 /**
  * Drives a scripted three-turn conversation against {@link ConversationService} once the Spring
@@ -42,9 +44,13 @@ public class ConversationRunner implements CommandLineRunner {
 //        this.client = client;
 //    }
 
-    private final ResolverService resolver;
-    public ConversationRunner(ResolverService resolver){
-        this.resolver = resolver;
+    // Day 14: the demo drives CachedResolutionService, not ResolverService. That is the bean the
+    // controller calls, so what this prints is the ACTUAL customer path — retrieve, key, cache-aside,
+    // ask — rather than a shortcut through the middle of it. A demo that exercises a path production
+    // does not use can only ever prove that the path production does not use works.
+    private final CachedResolutionService resolutions;
+    public ConversationRunner(CachedResolutionService resolutions){
+        this.resolutions = resolutions;
     }
 
     @Override
@@ -59,15 +65,22 @@ public class ConversationRunner implements CommandLineRunner {
         };
 
         for (int i = 0; i < tickets.length; i++) {
-            // resolve() retrieves matching KB entries, injects them into the prompt, then asks Claude.
-            Resolution resolution = resolver.resolve(tickets[i]);
+            // Semantic retrieval from pgvector, then the cache-aside resolve. Stateless per ticket.
+            Resolution resolution = resolutions.resolve(new ResolveTicketRequest(tickets[i]));
 
             System.out.println("=== Example ticket " + (i + 1) + " ===");
             System.out.println("User: " + tickets[i]);
             System.out.println("AURA: " + resolution.answer());
-            // KB ids that grounded the answer — e.g. [kb-returns]. Empty means the naive keyword
-            // filter whiffed and Claude answered from the prompt alone.
-            System.out.println("Sources: " + resolution.sourcesUsed());
+            // The grounding LEDGER: what was put in front of the model, with the distance that ranked
+            // it. Printing the distance rather than just the breadcrumb is what makes this readable as
+            // evidence — cosine distance is relative and never calibrated, so retrieval always returns
+            // a best match, and the number is the only thing that says whether "best" meant anything.
+            System.out.println("Sources provided:");
+            if (resolution.sourcesProvided().isEmpty()) {
+                System.out.println("   (none — this answer is ungrounded)");
+            }
+            resolution.sourcesProvided().forEach(source -> System.out.printf(Locale.ROOT,
+                    "   %.4f  %s  [%s]%n", source.distance(), source.breadcrumb(), source.chunkId()));
             System.out.println();
         }
 

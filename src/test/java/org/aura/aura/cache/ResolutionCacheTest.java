@@ -2,6 +2,7 @@ package org.aura.aura.cache;
 
 import org.aura.aura.resolver.Resolution;
 import org.aura.aura.resolver.ResolutionStatus;
+import org.aura.aura.retrieval.SourceRef;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
@@ -14,6 +15,7 @@ import tools.jackson.databind.json.JsonMapper;
 
 import java.time.Duration;
 import java.util.List;
+import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
@@ -78,7 +80,9 @@ class ResolutionCacheTest {
     // A failed write is swallowed: the caller already has a full-price answer to return.
     @Test
     void redisWriteFailureDoesNotPropagate() {
-        Resolution value = new Resolution("answer", List.of("kb-returns"), ResolutionStatus.RESOLVED, false);
+        Resolution value = new Resolution("answer",
+                List.of(new SourceRef(UUID.randomUUID(), "Refund Policy", 0.19)),
+                ResolutionStatus.RESOLVED, false);
         when(redis.opsForValue()).thenReturn(valueOps);
         doThrow(new RedisConnectionFailureException("redis down"))
                 .when(valueOps).set(anyString(), anyString(), any(Duration.class));

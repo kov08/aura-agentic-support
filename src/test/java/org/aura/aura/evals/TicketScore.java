@@ -41,8 +41,17 @@ public record TicketScore(
         return classifierDegraded && resolverDegraded;
     }
 
-    /** One outcome grade → resolved sources match, extra citations that only warn, or NOT graded. */
-    public record SourcesResult(Grade grade, List<String> missing, List<String> extra) {
+    /**
+     * One outcome grade → resolved sources match, extra citations that only warn, or NOT graded.
+     *
+     * @param reason why the dimension was not graded, empty when it was. A NOT_GRADED with no
+     *               explanation is indistinguishable from a dimension nobody bothered to implement —
+     *               and Day 14 made that distinction load-bearing, because the sources dimension is
+     *               now QUARANTINED rather than merely unlabelled. A reader of a results file has to
+     *               be able to tell "this ticket carried no label" from "this dimension is switched
+     *               off pending a relabel", and the only way to tell them apart is to say so.
+     */
+    public record SourcesResult(Grade grade, List<String> missing, List<String> extra, String reason) {
         public enum Grade { NOT_GRADED, PASS, FAIL }
 
         public boolean isFailure() {
@@ -55,7 +64,16 @@ public record TicketScore(
         }
 
         static SourcesResult notGraded() {
-            return new SourcesResult(Grade.NOT_GRADED, List.of(), List.of());
+            return notGraded("");
+        }
+
+        static SourcesResult notGraded(String reason) {
+            return new SourcesResult(Grade.NOT_GRADED, List.of(), List.of(), reason);
+        }
+
+        /** True when this dimension was switched off deliberately, as opposed to merely unlabelled. */
+        public boolean isQuarantined() {
+            return grade == Grade.NOT_GRADED && !reason.isEmpty();
         }
     }
 

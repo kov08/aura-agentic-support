@@ -7,6 +7,7 @@ import org.aura.aura.classification.ClassifierPromptProvider;
 import org.aura.aura.classification.TicketClassificationService;
 import org.aura.aura.resolver.Resolution;
 import org.aura.aura.resolver.ResolverService;
+import org.aura.aura.retrieval.RetrievalService;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -49,8 +50,15 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 @Tag("eval")
 @ActiveProfiles("test")   // suppresses ConversationRunner (@Profile("!test")), which would fire its own live call
-@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.NONE)
-class EvalRunner {
+@SpringBootTest(
+        webEnvironment = SpringBootTest.WebEnvironment.NONE,
+        // Day 14: an eval that scores a RAG system has to actually retrieve, so the corpus is ingested
+        // into the throwaway container during context startup. That is a billable Voyage pass per eval
+        // run, on top of the live Anthropic calls the harness already makes — a real cost increase,
+        // and the alternative is worse: an empty kb_chunks would make every ticket ungrounded and the
+        // whole run would score a system nobody ships.
+        properties = "aura.kb.load=true")
+class EvalRunner extends org.aura.aura.PostgresBackedContext {
 
     private final TicketClassificationService classifier;
 
@@ -59,6 +67,12 @@ class EvalRunner {
     // cached answer would score a PAST prompt version, and a cache WRITE would pollute production
     // with eval traffic. Anthropic prefix caching stays on (it changes billing, not output).
     private final ResolverService resolver;
+
+    // Day 14: retrieval is a separate step now, so the harness performs it — the same call
+    // CachedResolutionService makes, minus the cache. Injecting RetrievalService rather than letting
+    // the resolver retrieve internally is what keeps the "no Redis in evals" property above intact
+    // while still running the real retrieval the answers are graded on.
+    private final RetrievalService retrieval;
 
     // Stages are called INDEPENDENTLY, mirroring TicketController.resolve (TicketController:48): there,
     // classification does not feed the resolver — the resolver runs on the raw ticket text and the
@@ -72,9 +86,11 @@ class EvalRunner {
 
     @Autowired
     EvalRunner(TicketClassificationService classifier, ResolverService resolver,
+               RetrievalService retrieval,
                ResolverPromptProvider resolverPrompts, ClassifierPromptProvider classifierPrompts) {
         this.classifier = classifier;
         this.resolver = resolver;
+        this.retrieval = retrieval;
         this.resolverPrompts = resolverPrompts;
         this.classifierPrompts = classifierPrompts;
     }
@@ -91,7 +107,8 @@ class EvalRunner {
             try {
                 // Production order, stages independent (see field comment). Both calls hit the live API.
                 ClassificationResult classification = classifier.classify(ticket.customerMessage());
-                Resolution resolution = resolver.resolve(ticket.customerMessage());
+                Resolution resolution = resolver.resolve(
+                        ticket.customerMessage(), retrieval.retrieve(ticket.customerMessage()));
                 TicketScore score = scorer.score(ticket, classification, resolution);
                 graded.add(new Graded(ticket, classification, resolution, score));
             } catch (BadRequestException e) {
@@ -245,7 +262,12 @@ class EvalRunner {
         b.append("RESOLVER STAGE (Sonnet)\n");
         b.append(String.format("  escalate : %s   [majority-class floor: %s — judge against THIS, not zero]%n",
                 agg.escalate(), agg.escalateFloor()));
+        // The quarantine is announced HERE, in the human report, not left to be inferred from a 0/0
+        // ratio. A dimension that silently reports "0 of 0 graded" reads exactly like a dimension that
+        // passed, and the whole reason for keeping a reason string is that nobody should have to open
+        // the scorer to find out why a number is missing.
         b.append(String.format("  sources  : %s   (graded tickets only; null labels excluded)%n", agg.sources()));
+        b.append(String.format("             %s%n", EvalScorer.SOURCES_QUARANTINE_REASON));
         b.append(String.format("  reply    : %d rule-carrying ticket(s); %d with a mustContain miss, %d with a mustNot violation%n",
                 agg.replyRuleTickets(), agg.replyMustContainFail(), agg.replyMustNotFail()));
         b.append("\n");
@@ -314,7 +336,7 @@ class EvalRunner {
             }
             if (s.sourcesResult().isFailure()) {
                 b.append(String.format("      sources:  missing=%s extra=%s (actual=%s)%n",
-                        s.sourcesResult().missing(), s.sourcesResult().extra(), g.resolution().sourcesUsed()));
+                        s.sourcesResult().missing(), s.sourcesResult().extra(), EvalScorer.citedBreadcrumbs(g.resolution())));
             }
             for (TicketScore.RuleViolation miss : s.mustContainMisses()) {
                 b.append(String.format("      mustContain MISS: \"%s\" not in reply%n", miss.fragment()));
@@ -369,6 +391,9 @@ class EvalRunner {
         resolverStage.put("escalate", agg.escalate().toRatio());
         resolverStage.put("escalateMajorityClassFloor", agg.escalateFloor().toRatio());
         resolverStage.put("sources", agg.sources().toRatio());
+        // Committed alongside the number so an archived results file explains its own gap. A reader
+        // six months from now should not need this repository's history to know why sources is 0/0.
+        resolverStage.put("sourcesQuarantineReason", EvalScorer.SOURCES_QUARANTINE_REASON);
         resolverStage.put("replyRuleTickets", agg.replyRuleTickets());
         resolverStage.put("replyMustContainFail", agg.replyMustContainFail());
         resolverStage.put("replyMustNotFail", agg.replyMustNotFail());
@@ -406,6 +431,9 @@ class EvalRunner {
         row.put("intentMatch", s.intentMatch());
         row.put("escalateMatch", s.escalateMatch());
         row.put("sourcesGrade", s.sourcesResult().grade().name());
+        // Distinguishes "this ticket carried no label" from "the dimension is switched off" — two
+        // very different reasons for the same NOT_GRADED.
+        row.put("sourcesQuarantined", s.sourcesResult().isQuarantined());
         row.put("sourcesMissing", s.sourcesResult().missing());
         row.put("sourcesExtra", s.sourcesResult().extra());
         row.put("mustContainMisses", s.mustContainMisses().stream().map(TicketScore.RuleViolation::fragment).toList());
@@ -416,7 +444,7 @@ class EvalRunner {
         row.put("actualUrgency", g.classification().classification().urgency().name());
         row.put("actualIntent", g.classification().classification().intent().name());
         row.put("actualEscalate", g.resolution().escalate());
-        row.put("actualSources", g.resolution().sourcesUsed());
+        row.put("actualSources", EvalScorer.citedBreadcrumbs(g.resolution()));
         return row;
     }
 

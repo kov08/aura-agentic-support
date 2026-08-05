@@ -62,7 +62,9 @@ degraded and the resolver fell back to a human):
   "ticketId": "T-1001",
   "resolutionText": "…the customer-facing reply…",
   "outcome": "RESOLVED",
-  "sourcesUsed": ["kb-…"],
+  "sourcesProvided": [
+    { "chunkId": "98f35fbf-…", "breadcrumb": "Refund Policy > Standard Refund Window", "distance": 0.4943 }
+  ],
   "classification": {
     "category": "ORDER_STATUS",
     "urgency": "HIGH",
@@ -83,9 +85,15 @@ POST /api/v1/tickets/{id}/resolve
   ├─▶ TicketClassificationService ... Day 6  · native structured outputs (Haiku), runs FIRST as a cheap gate
   │      └ @CircuitBreaker ........... Day 8  · shared "anthropicApi" breaker (no retry — fallback is cheap)
   │
-  ▼  CachedResolutionService ........ Day 9  · Redis cache-aside — a HIT returns here and skips everything below
+  ▼  CachedResolutionService ........ Day 9  · orchestrates retrieve → key → cache-aside → resolve
+  │      │
+  │      ├─▶ RetrievalService ....... Day 14 · embed (query lane) → pgvector top-k → pack → canonical block
+  │      │      └ on failure ......... Day 14 · escalate to a human at HTTP 200, never a 5xx
+  │      │
+  │      ├ cache key ................ Day 14 · hashed AFTER retrieval, over the retrieved bytes (v2)
+  │      ▼  Redis cache-aside ....... Day 9  · a HIT returns here and skips everything below
   │      (MISS ↓)
-  ▼  ResolverService.resolve ........ Day 4  · KB retrieve → augment → resolve (Sonnet)
+  ▼  ResolverService.resolve ........ Day 4  · augment → resolve (Sonnet); context arrives pre-retrieved
   │      ├ @Retry + @CircuitBreaker .. Day 8  · transient allowlist retry, breaker, escalate-to-human fallback
   │      └ structured ResolverOutput . Day 10 · the escalate verdict is DATA, not prose
   │
@@ -529,6 +537,51 @@ Run (same as Day 1):
 ./mvnw spring-boot:run
 ```
 
+## Day 11 — 🏁 Milestone: robust single-agent bot, and the tests that prove it
+
+Days 8–10 built resilience and measured judgment. Day 11 is where both stop being claims: it adds the
+integration tests that drive the real Spring context over real HTTP, and fixes the two failures those
+tests found.
+
+*(Written retroactively during Day 14 — this section was missed at the time, and the gap between
+Day 10 and Day 12 was the tell.)*
+
+### The transport seam is configuration, not a code branch
+
+`aura.anthropic.base-url` and `aura.anthropic.timeout` bind from `AnthropicProperties` into the
+shared `AnthropicClient` bean. Production leaves `base-url` empty (the SDK's own endpoint); the
+integration tests point it at a local MockWebServer via `@DynamicPropertySource`.
+
+The property KEYS are identical in every profile, and that identity *is* the drift guard: the tests
+drive the exact properties production reads, so there is no test-only code path that can rot. A
+missing `ANTHROPIC_API_KEY` now fails the context at binding time with a message naming the env var,
+instead of surfacing as a 401 on the first Claude call.
+
+### Two failures the integration tests found
+
+**A hung response is not an I/O error.** A timeout that strikes while the response BODY is being read
+arrives as `AnthropicInvalidDataException` *caused by* a `SocketTimeoutException` — not as
+`AnthropicIoException`. Mapping only the obvious type left the most realistic outage shape (a
+provider that accepts the request and then stalls) classified as permanent, un-retried, and surfaced
+as a 500. It now escalates to a human, and `AnthropicTransientFailures.isReadTimeout` walks the whole
+cause chain rather than checking `getCause()` once.
+
+**The real outcome has to reach the wire.** `ResolutionResponse.outcome` was hardcoded `"RESOLVED"`,
+so a degraded `ESCALATED_TO_HUMAN` fallback was indistinguishable from a real answer to any client.
+It now maps the actual `ResolutionStatus`.
+
+### The test kit
+
+- `AnthropicTransportIT` — full context, real SDK, MockWebServer. Every scenario asserts a request
+  COUNT, never an elapsed duration: a retry is proven by "4 requests arrived", which cannot flake.
+- `RedisDegradationIT` — its OWN Redis container, because it stops Redis mid-test. Asserts the
+  customer cannot tell: byte-identical answer, and a request count that grew, proving the cache was
+  bypassed rather than hit.
+- The `it` profile carries the aggressive MockWebServer-only timeouts, so the eval harness (which
+  shares `test` but not `it`) keeps production's 30s and makes real calls under real conditions.
+- `docs/failure-runbook.md` records the two rows that stay manual — the ones a test would only
+  pretend to cover.
+
 ## Day 12 — RAG foundations: a real corpus, a chunker, and embeddings
 
 Day 4's knowledge base matched keywords, and Day 4's own transcript recorded its failure mode: a
@@ -842,4 +895,175 @@ docker compose up -d
 
 ```bash
 ./mvnw verify -Pdemo
+```
+
+## Day 14 — Semantic retrieval on the live path, a boot canary, and a repositioned cache
+
+Day 13 put the corpus in pgvector; the request path still ran Day 4's keyword filter. Day 14 connects
+them — and spends most of its effort on the three things that would otherwise have failed silently.
+
+Decisions are recorded as ADR-033/034/035 in [`docs/notes/day-14.md`](docs/notes/day-14.md), together
+with the day's weak spots and a revision card.
+
+### The failure mode this day is organised around
+
+A wrong embedding space does not throw. The request succeeds, the dimensions match, cosine similarity
+returns a number, the top-k comes back ranked and confident — and it is noise. The Day 12 lab measured
+exactly this. Every guard below exists because that shape of defect has no exception to catch.
+
+### The boot canary, and a band that was measured before it was used
+
+At startup, AURA re-embeds one stored chunk through the production query lane and compares it —
+using pgvector's own `<=>`, on the real table — against its stored document-lane vector. Out of band,
+it refuses to boot.
+
+The band is sampled first, by `CanaryBandHarnessIT`, under a rule fixed **before** any numbers
+existed:
+
+```
+band = [ observed_min - 0.5 x (max-min),  observed_max + 0.5 x (max-min) ]
+
+n=20, 2026-08-04:  min=0.24288794  max=0.24363139  spread=0.00074345  ->  [0.242516, 0.244003]
+```
+
+A threshold chosen by intuition and then calibrated in production is not a guard, it is a source of
+pages. Pre-registering the rule is what stops "the band looked tight so I widened it".
+
+**Booting now requires Voyage to be reachable.** That is the accepted cost of fail-fast, not an
+oversight — the alternative starts happily and retrieves from a space its queries no longer live in.
+
+### Breaking it on purpose: the lane flip, twice
+
+The pitfall this day earns is the asymmetric-lane flip (`input_type=query` vs `document`). Where you
+flip it decides which guard notices — and the drill found two real defects.
+
+**Inside `embedQuery`.** Boot refused, at **0.0669** against a floor of 0.242516. The flip removes the
+lane asymmetry and leaves only the model difference, so the two vectors agree *more* than the healthy
+baseline. A one-sided `distance <= max` guard — the shape most people write first — would have passed
+it. Some failures look like things getting better.
+
+It also measured how the baseline is composed: same-lane/different-model is 0.0669,
+different-lane/different-model is 0.2436. `input_type` does roughly 3.6x more work than the model
+tier, which is why this pairing is worth guarding at all.
+
+> **Defect found.** The guard refused the boot *and reported the wrong lane* — `voyage-4-lite/query`,
+> when `/document` had just been sent — because the lane was a literal in a format string. Its
+> likely-causes list sent the reader to the model config and the re-ingestion history, both of which
+> were fine. Fixed by routing the call and the report through one expression
+> (`VoyageEmbeddingClient.queryInputType()`), so there is no second place for them to disagree.
+> *Guards protect paths, not intentions — including inside their own error messages.*
+
+**At the call site** (`RetrievalService` calling `embedDocuments`). The canary boots green, because it
+calls `embedQuery` itself and never goes through `RetrievalService`: it proves the lane exists and is
+correct, and has no opinion about whether the request path uses it. In one run,
+`RetrievalCanaryCheckTest` passed 10/10 while retrieval was walking the wrong lane.
+
+> **Defect found.** The unit test written for exactly this did fail — but via
+> `NoSuchElementException`, because an unstubbed `embedDocuments` returns Mockito's default empty
+> list. The suite was relying on a library default to catch a production defect, and the designed
+> `verify(never())` was unreachable. Now the wrong lane is stubbed to *succeed*, so the failure reads
+> `NeverWantedButInvoked` and names the defect.
+
+### Retrieval policy — the numbers, and where they came from
+
+```
+corpus: n=33  total=4860  min=67  median=133  avg=147.27  p90=189  max=499
+```
+
+`k=8` is corpus-relative (~a quarter of today's chunks) and is the POOL width, not what the model
+sees — it costs one `LIMIT` clause, so it can be generous while the token budget is what actually
+costs money.
+
+`context-token-budget=700` is derived: "4-5 average chunks" gives a window of 589-736, and **max=499**
+pins it to the upper half — at 589 a max-size top hit plus a median chunk is 632, which admits only
+one chunk. Live, this packs 4 chunks / 599 tokens.
+
+Two packing rules that behave differently on purpose: **adjacency dedup skips and continues** (freed
+budget is re-spent on the next distinct chunk, so dedup raises information density rather than merely
+saving tokens), while **over-budget stops** (keeping the packed set a prefix of the ranking, so the
+result is explicable as "the top of the ranking, as much as fits").
+
+Adjacency is decided by identity — same document, chunk indexes one apart — never by comparing text.
+Neighbouring chunks genuinely share bytes by construction, so a similarity test would re-derive at
+request time a fact the schema already records exactly, and it would be a threshold, which is a
+tuning knob, which is a silent behaviour change.
+
+### Where you hash decides what can invalidate you
+
+The response-cache key moved to **after** retrieval and now hashes the rendered context bytes;
+prefix bumped `v1` -> `v2`.
+
+Before, a corrected refund window in `kb/` changed every answer the system should give while every
+input to the key stayed byte-identical — the stale answer served for a full 24h TTL, confidently,
+with a citation attached. `RagResolutionIT` proves the repair end to end: edit one chunk's content in
+Postgres, and the next identical ticket misses and re-asks.
+
+Deliberately **not** in the key: chunk ids alone (an in-place edit sails through — the id did not
+move), and embedding floats (a nonce in disguise; the key would never repeat and the cache would
+report a permanent 100% miss while every component reported healthy).
+
+The honest cost: **a cache hit is no longer free.** It pays one query embedding and one pgvector
+search before it can discover it is a hit. The expensive call — Sonnet — is still skipped.
+
+### Retrieval gets the degrade path Claude already had
+
+Moving retrieval ahead of the cache also moved it outside the Resilience4j stack. For one commit that
+meant a rate-limited embedding call produced a 500 while the identical failure one layer down
+produced a human handoff at 200 — same customer, same outage, two experiences, decided by which
+service happened to be unhealthy.
+
+Retrieval failure now degrades to `ESCALATED_TO_HUMAN` at HTTP 200, on the same allowlist discipline
+as Day 8: transient Voyage and unreachable-Postgres degrade, a permanent 401 (our bad key) still
+surfaces. Nothing is written to Redis on that path — and not because we remembered: the key is a hash
+*of* the retrieved bytes, so when retrieval fails there is no key. Unreachable beats guarded.
+
+### Bounding the two database waits
+
+Day 13's datasource ran entirely on defaults. The one that mattered: pgjdbc's `socketTimeout` was
+unset, so there was **no bound at all** on a query's wait for a reply — the Day 9 Redis lesson (an
+un-set timeout is not "fast by default", it is "unbounded by default") repeating on a different
+driver.
+
+```yaml
+hikari:
+  connection-timeout: 2000        # milliseconds - HikariConfig takes a long, so "2000ms" will NOT bind
+  data-source-properties:
+    socketTimeout: 2              # SECONDS - pgjdbc's unit
+```
+
+Note the two units in one file: `spring.data.redis.timeout` is a Duration and must read `250ms`.
+Read the target type, not the neighbour.
+
+These values are only affordable **because** of the degrade path above: both surface as exceptions
+already on its allowlist, so firing either hands the customer a human agent rather than an error
+page. Sized for the customer's patience, not the query's worst case.
+
+### What this day did not do
+
+- **Retrieval quality is unmeasured.** The budget comes from the corpus's size distribution and a
+  rule of thumb, never from an outcome — no recall@k, no sweep at 500 vs 700 vs 900.
+- **No relevance floor.** Distance is relative and never calibrated: an off-topic question still gets
+  a confident ranked list. The live demo's nearest hit was 0.4943, with a *Warranty* chunk second for
+  a returns question. The grounding instruction is currently the only thing between that and a
+  fabricated answer.
+- **The eval's sources dimension is quarantined**, not graded: every `expectedSources` label still
+  names a retired hardcoded-KB id. The grading rules are intact and still unit-tested; re-enabling is
+  one line plus a relabel.
+
+### Commands
+
+```bash
+docker compose up -d
+```
+
+```bash
+./mvnw verify
+```
+
+```bash
+./mvnw spring-boot:run -Daura.kb.load=true
+```
+
+```bash
+./mvnw verify -Pdemo -Dit.test=CanaryBandHarnessIT
 ```

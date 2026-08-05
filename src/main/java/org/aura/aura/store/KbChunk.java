@@ -149,4 +149,19 @@ public class KbChunk {
     public OffsetDateTime getCreatedAt() {
         return createdAt;
     }
+
+    /**
+     * The exact string that was embedded to produce {@link #embedding}, reconstructed from the two
+     * columns it was built from.
+     *
+     * <p>Delegates to {@link org.aura.aura.domain.Chunk#embeddingInput(String, String)} rather than
+     * re-concatenating here. That indirection is the whole point: ingestion embeds
+     * {@code Chunk.embeddingInput()}, and the Day 14 canary re-embeds THIS — if the two ever computed
+     * the concatenation independently, a one-character difference would move the canary's measured
+     * distance without moving anything the canary is supposed to detect, and the band would drift for
+     * a reason that has nothing to do with the embedding lanes.
+     */
+    public String embeddingInput() {
+        return org.aura.aura.domain.Chunk.embeddingInput(breadcrumb, content);
+    }
 }
