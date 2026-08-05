@@ -902,9 +902,6 @@ docker compose up -d
 Day 13 put the corpus in pgvector; the request path still ran Day 4's keyword filter. Day 14 connects
 them — and spends most of its effort on the three things that would otherwise have failed silently.
 
-Decisions are recorded as ADR-033/034/035 in [`docs/notes/day-14.md`](docs/notes/day-14.md), together
-with the day's weak spots and a revision card.
-
 ### The failure mode this day is organised around
 
 A wrong embedding space does not throw. The request succeeds, the dimensions match, cosine similarity
