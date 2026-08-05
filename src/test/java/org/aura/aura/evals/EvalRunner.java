@@ -261,8 +261,13 @@ class EvalRunner extends org.aura.aura.PostgresBackedContext {
         b.append("\n");
         b.append("RESOLVER STAGE (Sonnet)\n");
         b.append(String.format("  escalate : %s   [majority-class floor: %s — judge against THIS, not zero]%n",
-                agg.escalate(), agg.escalateFloor()));
-        b.append(String.format("  sources  : %s   (graded tickets only; null labels excluded)%n", agg.sources()));
+                agg.escalate(), agg.escalateFloor()));
+        // The quarantine is announced HERE, in the human report, not left to be inferred from a 0/0
+        // ratio. A dimension that silently reports "0 of 0 graded" reads exactly like a dimension that
+        // passed, and the whole reason for keeping a reason string is that nobody should have to open
+        // the scorer to find out why a number is missing.
+        b.append(String.format("  sources  : %s   (graded tickets only; null labels excluded)%n", agg.sources()));
+        b.append(String.format("             %s%n", EvalScorer.SOURCES_QUARANTINE_REASON));
         b.append(String.format("  reply    : %d rule-carrying ticket(s); %d with a mustContain miss, %d with a mustNot violation%n",
                 agg.replyRuleTickets(), agg.replyMustContainFail(), agg.replyMustNotFail()));
         b.append("\n");
@@ -385,7 +390,10 @@ class EvalRunner extends org.aura.aura.PostgresBackedContext {
         Map<String, Object> resolverStage = new LinkedHashMap<>();
         resolverStage.put("escalate", agg.escalate().toRatio());
         resolverStage.put("escalateMajorityClassFloor", agg.escalateFloor().toRatio());
-        resolverStage.put("sources", agg.sources().toRatio());
+        resolverStage.put("sources", agg.sources().toRatio());
+        // Committed alongside the number so an archived results file explains its own gap. A reader
+        // six months from now should not need this repository's history to know why sources is 0/0.
+        resolverStage.put("sourcesQuarantineReason", EvalScorer.SOURCES_QUARANTINE_REASON);
         resolverStage.put("replyRuleTickets", agg.replyRuleTickets());
         resolverStage.put("replyMustContainFail", agg.replyMustContainFail());
         resolverStage.put("replyMustNotFail", agg.replyMustNotFail());
@@ -422,7 +430,10 @@ class EvalRunner extends org.aura.aura.PostgresBackedContext {
         row.put("urgencyMatch", s.urgencyMatch());
         row.put("intentMatch", s.intentMatch());
         row.put("escalateMatch", s.escalateMatch());
-        row.put("sourcesGrade", s.sourcesResult().grade().name());
+        row.put("sourcesGrade", s.sourcesResult().grade().name());
+        // Distinguishes "this ticket carried no label" from "the dimension is switched off" — two
+        // very different reasons for the same NOT_GRADED.
+        row.put("sourcesQuarantined", s.sourcesResult().isQuarantined());
         row.put("sourcesMissing", s.sourcesResult().missing());
         row.put("sourcesExtra", s.sourcesResult().extra());
         row.put("mustContainMisses", s.mustContainMisses().stream().map(TicketScore.RuleViolation::fragment).toList());

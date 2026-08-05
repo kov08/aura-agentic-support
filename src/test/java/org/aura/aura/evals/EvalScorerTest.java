@@ -82,7 +82,9 @@ class EvalScorerTest {
         assertThat(s.urgencyMatch()).isTrue();
         assertThat(s.intentMatch()).isTrue();
         assertThat(s.escalateMatch()).isTrue();
-        assertThat(s.sourcesResult().grade()).isEqualTo(TicketScore.SourcesResult.Grade.PASS);
+        // NOT_GRADED, not PASS: the sources dimension is quarantined (Day 14). Everything else on this
+        // ticket still grades, which is the property the quarantine had to preserve.
+        assertThat(s.sourcesResult().grade()).isEqualTo(TicketScore.SourcesResult.Grade.NOT_GRADED);
         assertThat(s.mustContainMisses()).isEmpty();
         assertThat(s.mustNotViolations()).isEmpty();
     }
@@ -209,79 +211,101 @@ class EvalScorerTest {
         assertThat(s.passed()).isTrue();
     }
 
-    // ---- expectedSources: the three-valued rule (R1) --------------------------------------------
+    // ---- expectedSources: the QUARANTINE (Day 14) ------------------------------------------------
+
+    @Test
+    void sources_isQuarantinedRegardlessOfLabel_andCannotFailATicket() {
+        // The label here is one the retired ids would have FAILED under the old grading — a non-empty
+        // expectation against an actual set that shares nothing with it. Quarantined, it produces
+        // NOT_GRADED and leaves the ticket passing on its other dimensions.
+        TicketScore s = scorer.score(
+                ticket(baselineLabel(List.of("kb-returns"), List.of(), List.of())),
+                goodClassification(),
+                resolved("...", List.of("Refund Policy > Standard Refund Window"), false));
+
+        assertThat(s.sourcesResult().grade()).isEqualTo(TicketScore.SourcesResult.Grade.NOT_GRADED);
+        assertThat(s.passed())
+                .as("a switched-off dimension must not fail tickets — that is the point of switching "
+                        + "it off rather than leaving it permanently red")
+                .isTrue();
+    }
+
+    @Test
+    void sources_quarantineCarriesItsReasonSoAResultsFileExplainsItself() {
+        TicketScore s = scorer.score(
+                ticket(baselineLabel(List.of("kb-returns"), List.of(), List.of())),
+                goodClassification(),
+                resolved("...", List.of(), false));
+
+        // isQuarantined() is what separates "this ticket had no label" from "this dimension is off".
+        // Both are NOT_GRADED, and only one of them is a decision someone made.
+        assertThat(s.sourcesResult().isQuarantined()).isTrue();
+        assertThat(s.sourcesResult().reason())
+                .contains("QUARANTINED")
+                .contains("kb-returns")        // names the retired ids
+                .contains("Day 16");           // names the relabel that lifts it
+    }
+
+    // ---- expectedSources: the three-valued rule (R1), still pinned while quarantined -------------
+    //
+    // These call gradeSources DIRECTLY rather than through score(). That is the whole reason the
+    // quarantine was implemented at the call site instead of by gutting the method: the rules below
+    // are still the rules, they are still the ones Day 16 will re-enable, and a quarantine that also
+    // deleted their coverage would mean re-deriving them from scratch — at which point "re-enable" is
+    // a rewrite rather than a one-line change.
 
     @Test
     void sources_nullLabel_isNotGraded() {
-        TicketScore s = scorer.score(
-                ticket(baselineLabel(null, List.of(), List.of())),
-                goodClassification(),
-                resolved("...", List.of("kb-returns", "kb-shipping"), false));
+        var result = EvalScorer.gradeSources(null, List.of("kb-returns", "kb-shipping"));
 
-        assertThat(s.sourcesResult().grade()).isEqualTo(TicketScore.SourcesResult.Grade.NOT_GRADED);
-        // Ungraded sources cannot fail the ticket.
-        assertThat(s.passed()).isTrue();
+        assertThat(result.grade()).isEqualTo(TicketScore.SourcesResult.Grade.NOT_GRADED);
+        // An unlabelled ticket is NOT quarantined — nobody switched anything off, the label is absent.
+        assertThat(result.isQuarantined()).isFalse();
     }
 
     @Test
     void sources_emptyLabel_passesOnlyWhenActualAlsoEmpty() {
-        TicketScore s = scorer.score(
-                ticket(baselineLabel(List.of(), List.of(), List.of())),
-                goodClassification(),
-                resolved("...", List.of(), false));
+        var result = EvalScorer.gradeSources(List.of(), List.of());
 
-        assertThat(s.sourcesResult().grade()).isEqualTo(TicketScore.SourcesResult.Grade.PASS);
-        assertThat(s.passed()).isTrue();
+        assertThat(result.grade()).isEqualTo(TicketScore.SourcesResult.Grade.PASS);
     }
 
     // THE TRAP (R1): an empty label with any actual citation must FAIL, never pass vacuously.
     @Test
     void sources_emptyLabel_failsWhenActualNonEmpty() {
-        TicketScore s = scorer.score(
-                ticket(baselineLabel(List.of(), List.of(), List.of())),
-                goodClassification(),
-                resolved("...", List.of("kb-returns"), false));
+        var result = EvalScorer.gradeSources(List.of(), List.of("kb-returns"));
 
-        assertThat(s.sourcesResult().grade()).isEqualTo(TicketScore.SourcesResult.Grade.FAIL);
-        assertThat(s.sourcesResult().extra()).containsExactly("kb-returns");
-        assertThat(s.passed()).isFalse();
+        assertThat(result.grade()).isEqualTo(TicketScore.SourcesResult.Grade.FAIL);
+        assertThat(result.extra()).containsExactly("kb-returns");
+        assertThat(result.isFailure()).isTrue();
     }
 
     @Test
     void sources_nonEmptyLabel_passesOnExactSubset() {
-        TicketScore s = scorer.score(
-                ticket(baselineLabel(List.of("kb-returns"), List.of(), List.of())),
-                goodClassification(),
-                resolved("...", List.of("kb-returns"), false));
+        var result = EvalScorer.gradeSources(List.of("kb-returns"), List.of("kb-returns"));
 
-        assertThat(s.sourcesResult().grade()).isEqualTo(TicketScore.SourcesResult.Grade.PASS);
-        assertThat(s.passed()).isTrue();
+        assertThat(result.grade()).isEqualTo(TicketScore.SourcesResult.Grade.PASS);
     }
 
     @Test
     void sources_nonEmptyLabel_missingExpected_fails() {
-        TicketScore s = scorer.score(
-                ticket(baselineLabel(List.of("kb-returns", "kb-refund-time"), List.of(), List.of())),
-                goodClassification(),
-                resolved("...", List.of("kb-returns"), false));
+        var result = EvalScorer.gradeSources(
+                List.of("kb-returns", "kb-refund-time"), List.of("kb-returns"));
 
-        assertThat(s.sourcesResult().grade()).isEqualTo(TicketScore.SourcesResult.Grade.FAIL);
-        assertThat(s.sourcesResult().missing()).containsExactly("kb-refund-time");
-        assertThat(s.passed()).isFalse();
+        assertThat(result.grade()).isEqualTo(TicketScore.SourcesResult.Grade.FAIL);
+        assertThat(result.missing()).containsExactly("kb-refund-time");
     }
 
     // Extra citations beyond the expected subset are WARNINGS, not failures.
     @Test
     void sources_nonEmptyLabel_extraCitations_passWithWarning() {
-        TicketScore s = scorer.score(
-                ticket(baselineLabel(List.of("kb-returns"), List.of(), List.of())),
-                goodClassification(),
-                resolved("...", List.of("kb-returns", "kb-shipping"), false));
+        var result = EvalScorer.gradeSources(
+                List.of("kb-returns"), List.of("kb-returns", "kb-shipping"));
 
-        assertThat(s.sourcesResult().grade()).isEqualTo(TicketScore.SourcesResult.Grade.PASS);
-        assertThat(s.sourcesResult().hasWarnings()).isTrue();
-        assertThat(s.sourcesResult().extra()).containsExactly("kb-shipping");
-        assertThat(s.passed()).isTrue();
+        assertThat(result.grade()).isEqualTo(TicketScore.SourcesResult.Grade.PASS);
+        assertThat(result.hasWarnings()).isTrue();
+        assertThat(result.extra()).containsExactly("kb-shipping");
+        assertThat(result.isFailure()).isFalse();
     }
 
     // ---- per-stage degradation ------------------------------------------------------------------
