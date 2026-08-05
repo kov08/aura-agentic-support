@@ -1,11 +1,13 @@
 package org.aura.aura.canary;
 
+import org.aura.aura.client.EmbeddingInputType;
 import org.aura.aura.client.VoyageEmbeddingClient;
 import org.aura.aura.config.CanaryProperties;
 import org.aura.aura.config.VoyageProperties;
 import org.aura.aura.store.ChunkRepository;
 import org.aura.aura.store.KbChunk;
 import org.aura.aura.util.VectorLiterals;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
@@ -18,6 +20,8 @@ import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.catchThrowable;
+import static org.mockito.Mockito.lenient;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
@@ -61,6 +65,20 @@ class RetrievalCanaryCheckTest {
     @Mock ChunkRepository chunks;
     @Mock VoyageEmbeddingClient voyage;
 
+    /**
+     * The client reports its own lanes, so a mocked client has to be told what to report. Stubbed
+     * {@code lenient()} because the two absent-row tests below never reach a message or a log line
+     * and would otherwise trip strict-stub checking.
+     *
+     * <p>These are the honest defaults — what the real client returns. The lane-flip test overrides
+     * {@code queryInputType} to reproduce the drill.
+     */
+    @BeforeEach
+    void lanesReportThemselves() {
+        lenient().when(voyage.queryInputType()).thenReturn(EmbeddingInputType.QUERY);
+        lenient().when(voyage.documentInputType()).thenReturn(EmbeddingInputType.DOCUMENT);
+    }
+
     // ---------------------------------------------------------------- the gate
 
     @Test
@@ -93,6 +111,45 @@ class RetrievalCanaryCheckTest {
                 .hasMessageContaining("voyage-4-large").hasMessageContaining("document")
                 .hasMessageContaining("voyage-4-lite").hasMessageContaining("query")
                 .hasMessageContaining(DOC + "#" + INDEX);
+    }
+
+    /**
+     * THE regression test for the Day 14 lane-flip drill. Flipping {@code embedQuery}'s input_type to
+     * DOCUMENT correctly tripped the guard — and the guard then reported {@code voyage-4-lite/query},
+     * because the lane was a literal in the format string rather than a value read back from the
+     * client. The message exonerated the actual cause: its likely-causes list sent the reader to the
+     * model config and the re-ingestion history, both of which were fine.
+     *
+     * <p>So the assertion is not "the message mentions a lane" but "the message mentions the lane the
+     * client REALLY USED". Here the client reports DOCUMENT on both sides — the flipped state — and
+     * the message must say so, and must not claim query.
+     */
+    @Test
+    void anOutOfBandMessageReportsTheLaneTheClientActuallySent() {
+        canaryRowExists();
+        when(voyage.queryInputType()).thenReturn(EmbeddingInputType.DOCUMENT);   // the flip
+        when(voyage.embedQuery(embeddingInput())).thenReturn(QUERY_VECTOR);
+        when(chunks.distanceFrom(eq(DOC), eq(INDEX), eq(VectorLiterals.toLiteral(QUERY_VECTOR))))
+                .thenReturn(Optional.of(0.0668));   // the distance the real drill produced
+
+        Throwable thrown = catchThrowable(() -> check(storeProbeOff()).run());
+
+        assertThat(thrown).isInstanceOf(IllegalStateException.class);
+        assertThat(thrown.getMessage())
+                .as("the guard must report the lane it sent, and must not claim one it did not")
+                .contains("voyage-4-lite/document")
+                .doesNotContain("voyage-4-lite/query");
+    }
+
+    @Test
+    void anOutOfBandMessageNamesTheInputTypeFlipAsACandidateCause() {
+        // The other half of the same repair. Reporting the lane honestly is not enough if the reader
+        // still has no reason to suspect it — the cause list has to contain the thing the drill broke.
+        canaryRowExists();
+        queryLaneReturns(0.0668);
+
+        assertThatThrownBy(() -> check(storeProbeOff()).run())
+                .hasMessageContaining("input_type was changed");
     }
 
     @Test

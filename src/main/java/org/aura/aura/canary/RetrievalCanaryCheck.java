@@ -133,32 +133,51 @@ public class RetrievalCanaryCheck implements SmartInitializingSingleton {
         OptionalDouble storeProbe = runStoreProbe(canary);
 
         if (!props.band().contains(distance)) {
+            // EVERY value in this message is OBSERVED, not asserted. The lane comes from
+            // voyage.queryInputType() — the same expression embedQuery just routed through — rather
+            // than from the word "query" in a format string.
+            //
+            // That distinction was earned. The first version of this message hard-coded "/query", and
+            // the Day 14 lane-flip drill flipped embedQuery's input_type to DOCUMENT: the guard
+            // correctly refused the boot AND confidently reported the lane it believed it had used,
+            // exonerating the actual cause. An operator following its likely-causes list would have
+            // checked the model config and the re-ingestion history, found both correct, and never
+            // suspected input_type — because the message told them the lane was fine. A diagnostic
+            // that states an intention is worse than no diagnostic; it sends people the wrong way.
             throw new IllegalStateException(String.format(Locale.ROOT,
                     "retrieval canary OUT OF BAND: observed distance %.8f, healthy band %s. "
-                            + "The pairing under test is STORED %s/document (kb_chunks %s#%d, "
-                            + "embedding_model=%s) vs FRESH %s/query. "
+                            + "The pairing under test is STORED %s/%s (kb_chunks %s#%d) vs FRESH %s/%s "
+                            + "(via VoyageEmbeddingClient.embedQuery). "
                             + "These two vectors are supposed to sit in one shared embedding space, and "
                             + "this measurement says they no longer do — so every similarity score this "
                             + "application produces is meaningless, while nothing else would throw. "
-                            + "Likely causes, in order: voyage.query-model or voyage.document-model was "
-                            + "changed without re-embedding the corpus; the corpus was re-ingested under "
-                            + "a different model; or the provider changed a model behind a stable name. "
+                            + "Likely causes, in order: the query lane's input_type was changed (compare "
+                            + "the FRESH lane above against the STORED one — if they now match, that is "
+                            + "the bug, and the distance will have collapsed toward zero); "
+                            + "voyage.query-model or voyage.document-model was changed without "
+                            + "re-embedding the corpus; the corpus was re-ingested under a different "
+                            + "model; or the provider changed a model behind a stable name. "
                             + "Set aura.canary.store-probe.enabled=true to learn which SIDE moved. Do not "
                             + "widen the band to make this pass — re-measure it with CanaryBandHarnessIT "
                             + "once the cause is understood.",
                     distance, props.band(),
-                    canary.getEmbeddingModel(), canary.getSourceDoc(), canary.getChunkIndex(),
-                    canary.getEmbeddingModel(), voyageProps.queryModel()));
+                    // STORED side: the model is read off the ROW (provenance, not configuration), and
+                    // the lane is the document lane by definition of how ingestion writes.
+                    canary.getEmbeddingModel(), voyage.documentInputType().wireValue(),
+                    canary.getSourceDoc(), canary.getChunkIndex(),
+                    // FRESH side: both values as the client actually used them a few lines above.
+                    voyageProps.queryModel(), voyage.queryInputType().wireValue()));
         }
 
         // In band: ONE line, at INFO, carrying the observed value. Logging the number on every healthy
         // boot costs nothing and turns the guard into a free time series — the band can be re-derived
         // from a month of boots without running the harness again, and a distance drifting steadily
         // toward an edge becomes visible well before it crosses one.
-        log.info("retrieval canary OK — distance={} within band {} ({}/document {}#{} vs {}/query)",
+        log.info("retrieval canary OK — distance={} within band {} ({}/{} {}#{} vs {}/{})",
                 String.format(Locale.ROOT, "%.8f", distance), props.band(),
-                canary.getEmbeddingModel(), canary.getSourceDoc(), canary.getChunkIndex(),
-                voyageProps.queryModel());
+                canary.getEmbeddingModel(), voyage.documentInputType().wireValue(),
+                canary.getSourceDoc(), canary.getChunkIndex(),
+                voyageProps.queryModel(), voyage.queryInputType().wireValue());
 
         return new CanaryReading(false, OptionalDouble.of(distance), storeProbe);
     }
@@ -190,13 +209,14 @@ public class RetrievalCanaryCheck implements SmartInitializingSingleton {
         float[] fresh = voyage.embedDocuments(java.util.List.of(canary.embeddingInput())).getFirst();
         double distance = measure(canary, fresh);
 
-        log.info("retrieval canary STORE PROBE — distance={} ({}/document stored vs {}/document fresh). "
+        log.info("retrieval canary STORE PROBE — distance={} ({}/{} stored vs {}/{} fresh). "
                         + "Near zero means the store side is intact and a canary trip came from the query "
                         + "lane; clearly non-zero means the stored vectors are stale and the corpus needs "
                         + "re-embedding. This probe never fails the boot — the configured band belongs to "
                         + "the large/document vs lite/query pairing and does not apply here.",
                 String.format(Locale.ROOT, "%.8f", distance),
-                canary.getEmbeddingModel(), voyageProps.documentModel());
+                canary.getEmbeddingModel(), voyage.documentInputType().wireValue(),
+                voyageProps.documentModel(), voyage.documentInputType().wireValue());
 
         return OptionalDouble.of(distance);
     }
