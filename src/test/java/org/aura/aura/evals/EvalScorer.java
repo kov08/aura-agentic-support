@@ -40,7 +40,7 @@ public final class EvalScorer {
      * exactly those. Those ids no longer exist anywhere: retrieval returns real chunks now, identified
      * by a uuid and a breadcrumb.
      *
-     * <p>The uuid is not a usable label — {@code KbCorpusLoader} assigns a fresh random one on every
+     * <p>The uuid is not a usable label — the ingestion pipeline assigns a fresh random one on every
      * ingest, so a golden set pinned to uuids would go stale on every reload. The breadcrumb
      * ({@code "Refund Policy > Standard Refund Window"}) is stable across re-ingestion, human-readable,
      * and is what a labeller can actually write down, so it is the identifier the dimension will use
