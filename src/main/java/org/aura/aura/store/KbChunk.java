@@ -19,8 +19,8 @@ import java.util.UUID;
  * it. {@code Chunk} is the chunker's output: pure, immutable, storage-unaware, and unit-tested with no
  * Spring context at all. This is a mutable, identity-bearing JPA entity whose shape is dictated by a
  * table. Fusing them would drag JPA into the chunker's tests and let a schema change ripple into a
- * pure-logic type; keeping them apart costs one small mapping in {@code KbCorpusLoader} and buys that
- * separation outright.
+ * pure-logic type; keeping them apart costs one small mapping in {@code IngestionPipeline} and buys
+ * that separation outright.
  *
  * <h2>The vector column</h2>
  * {@code @JdbcTypeCode(SqlTypes.VECTOR)} plus {@code @Array(length = ...)} is what makes
@@ -59,6 +59,33 @@ public class KbChunk {
     @Id
     private UUID id;
 
+    /**
+     * The parent {@link KbDocument}, as a RAW UUID rather than a {@code @ManyToOne} association.
+     *
+     * <p>The association is what JPA would suggest and it would cost more than it pays for here.
+     * Nothing in this codebase ever navigates from a chunk to its document — retrieval projects
+     * scalar columns ({@link NearestChunk}) and never loads this entity on the hot path at all, and
+     * ingestion already holds the document in hand when it builds these rows. So the association
+     * would buy a traversal nobody performs, and charge for it with a proxy that
+     * {@code open-in-view=false} turns into a {@code LazyInitializationException} the first time
+     * anything outside a transaction touches it.
+     *
+     * <p>What is genuinely lost: Hibernate no longer knows these two entities are related, so it
+     * cannot order inserts for us. {@code IngestionPipeline} pays that back explicitly with a
+     * {@code saveAndFlush} on the document before the chunks are written — visible ordering instead
+     * of inferred ordering. The FOREIGN KEY in V3 is what makes a mistake there fail loudly.
+     */
+    @Column(name = "document_id", nullable = false)
+    private UUID documentId;
+
+    /**
+     * The citation handle, and DUPLICATED from {@code kb_documents.path} on purpose.
+     *
+     * <p>Normalising it away would mean a join on every retrieval query to render a citation, on a
+     * value that is immutable for the life of the row — a chunk is deleted and rebuilt when its
+     * document changes, never re-pointed. The duplication cannot drift because the only writer is the
+     * ingestion pipeline, which sets both from one scan.
+     */
     @Column(name = "source_doc", nullable = false)
     private String sourceDoc;
 
@@ -102,9 +129,10 @@ public class KbChunk {
     protected KbChunk() {
     }
 
-    public KbChunk(UUID id, String sourceDoc, int chunkIndex, String breadcrumb, String content,
-                   int tokenCount, float[] embedding, String embeddingModel) {
+    public KbChunk(UUID id, UUID documentId, String sourceDoc, int chunkIndex, String breadcrumb,
+                   String content, int tokenCount, float[] embedding, String embeddingModel) {
         this.id = id;
+        this.documentId = documentId;
         this.sourceDoc = sourceDoc;
         this.chunkIndex = chunkIndex;
         this.breadcrumb = breadcrumb;
@@ -116,6 +144,10 @@ public class KbChunk {
 
     public UUID getId() {
         return id;
+    }
+
+    public UUID getDocumentId() {
+        return documentId;
     }
 
     public String getSourceDoc() {

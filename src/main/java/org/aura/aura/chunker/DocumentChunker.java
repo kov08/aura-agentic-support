@@ -47,6 +47,38 @@ import java.util.stream.Collectors;
 @Service
 public class DocumentChunker {
 
+    /**
+     * The version of THIS ALGORITHM, folded into every document fingerprint by
+     * {@link org.aura.aura.ingest.DocumentFingerprinter}.
+     *
+     * <h2>What it is for</h2>
+     * A fingerprint over content alone answers "did the file change?". The pipeline needs the answer
+     * to a larger question — "would re-running today produce the same chunks?" — and chunking is half
+     * of what produces them. Change the separator hierarchy, the heading-path rules, or the overlap
+     * behaviour, and the same bytes yield different chunks with different boundaries and therefore
+     * different vectors. Without this constant in the hash, that change ships and the pipeline
+     * reports every document unchanged: a corpus chunked under two incompatible regimes, and no
+     * signal anywhere. Exactly the silent-failure shape the Day 12 cross-model lab measured, one
+     * layer up.
+     *
+     * <h2>When to bump it</h2>
+     * Whenever a change to this class could move a chunk boundary or alter a breadcrumb for input
+     * that is otherwise identical. Bumping it is the deliberate act of saying "re-embed the whole
+     * corpus" — which costs a premium-model call per chunk, so it is a decision and not a reflex.
+     * Renaming a private method or rewording a comment is not that; changing {@link #SEPARATORS},
+     * {@link #packCap()}, {@link #withOverlap}, or the section rules is.
+     *
+     * <p>Note what is NOT here: {@code maxChunkChars} and {@code overlapChars}. Those are
+     * CONFIGURATION, not algorithm, and they already reach the fingerprint the honest way — through
+     * their effect on... nothing, actually, which is a gap worth naming. A change to
+     * {@code voyage.max-chunk-chars} re-chunks the corpus without moving any fingerprint. It is
+     * caught today only because changing it is a config diff a human reads. Folding the two knobs
+     * into the hash is the obvious fix and is deliberately not done here: it would make the
+     * fingerprint depend on {@code VoyageProperties}, turning a pure function into a wired one, and
+     * the value of that trade has not been argued. Bump this constant by hand when you change them.
+     */
+    public static final String CHUNKER_VERSION = "v1";
+
     // A markdown ATX heading: 1-6 '#' then the title. setext headings (=== underlines) are not used
     // in kb/ and are not supported — an unsupported heading style degrades to "part of the previous
     // section's body", which is a correctness-preserving failure.

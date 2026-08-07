@@ -1,11 +1,11 @@
 package org.aura.aura.store;
 
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
 import java.util.List;
-import java.util.Optional;
 import java.util.UUID;
 
 /**
@@ -85,34 +85,36 @@ public interface ChunkRepository extends JpaRepository<KbChunk, UUID> {
                                                @Param("k") int k);
 
     /**
-     * The canary row, addressed by the identity the schema already declares unique
-     * ({@code source_doc, chunk_index}) rather than by its uuid.
+     * Removes every chunk belonging to one document — the DELETE half of Day 15's per-document swap.
      *
-     * <p>The uuid would be the obvious key and is the wrong one: {@code KbCorpusLoader} assigns
-     * {@code UUID.randomUUID()} at ingestion, so it changes on every re-ingest. A canary pinned to a
-     * value that changes whenever the corpus is reloaded is a canary that fails for the one reason it
-     * is not meant to detect.
+     * <h2>Why a bulk query and not {@code deleteByDocumentId} derived by Spring Data</h2>
+     * A derived {@code deleteBy...} SELECTs the matching entities, materialises them, and issues one
+     * DELETE per row so entity lifecycle callbacks can fire. There are no callbacks on
+     * {@link KbChunk}, so all that buys is N+1 statements and a persistence context full of rows
+     * about to stop existing. This is one statement.
+     *
+     * <h2>The ordering property the pipeline depends on</h2>
+     * {@code @Modifying} queries execute when the method is CALLED, not at flush. That is what makes
+     * "delete the old chunks, then insert the new ones" true on the wire and not merely true in the
+     * source: the inserts queued afterwards are flushed at commit, strictly later. Without it,
+     * Hibernate's own flush ordering puts inserts before deletes and the swap collides with
+     * {@code UNIQUE (source_doc, chunk_index)} on every re-ingestion of a changed document.
+     *
+     * <p>It also bypasses the persistence context entirely — rows deleted here stay cached if they
+     * were already loaded. Nothing in the pipeline loads chunks before deleting them, so there is no
+     * stale instance to be confused by; a future caller that does needs {@code clearAutomatically}.
+     *
+     * @return how many rows were removed — the number the swap logs, so a re-ingest that silently
+     *         matched nothing is visible rather than inferred
      */
-    Optional<KbChunk> findBySourceDocAndChunkIndex(String sourceDoc, int chunkIndex);
+    @Modifying
+    @Query("DELETE FROM KbChunk c WHERE c.documentId = :documentId")
+    int deleteByDocumentId(@Param("documentId") UUID documentId);
 
-    /**
-     * The cosine distance between one stored chunk's embedding and a supplied query vector —
-     * measured by Postgres, with the same operator the ranked search uses.
-     *
-     * <p>The canary could have computed this in the JVM with {@link org.aura.aura.util.VectorMath}
-     * and one fewer round-trip. It does not, and that is the point of the guard: the number the
-     * canary compares against a pre-registered band has to be measured on the SAME arithmetic every
-     * customer query is ranked by, or the band is calibrated against something no request rides.
-     *
-     * @return empty when no row carries that identity — the caller decides whether that is a
-     *         not-yet-ingested corpus (benign) or a drifted canary (not)
-     */
-    @Query(value = """
-            SELECT embedding <=> CAST(:queryVector AS vector)
-            FROM kb_chunks
-            WHERE source_doc = :sourceDoc AND chunk_index = :chunkIndex
-            """, nativeQuery = true)
-    Optional<Double> distanceFrom(@Param("sourceDoc") String sourceDoc,
-                                  @Param("chunkIndex") int chunkIndex,
-                                  @Param("queryVector") String queryVector);
+    // NOTE (V4) — findBySourceDocAndChunkIndex and distanceFrom used to sit here, and both existed
+    // solely for RetrievalCanaryCheck. They went with the canary when its vector moved out of this
+    // table into canary_probe. Deleting them rather than keeping them "in case" is the point: a
+    // lookup into the retrieval corpus by (source_doc, chunk_index) plus a distance measured against
+    // one such row is precisely the toolkit that would let the canary drift back in here. See
+    // CanaryProbeRepository, where both now live against a table retrieval never reads.
 }

@@ -2,7 +2,8 @@ package org.aura.aura;
 
 import org.aura.aura.client.VoyageEmbeddingClient;
 import org.aura.aura.config.VoyageProperties;
-import org.aura.aura.ingest.KbCorpusLoader;
+import org.aura.aura.ingest.IngestReport;
+import org.aura.aura.ingest.IngestionPipeline;
 import org.aura.aura.store.ChunkRepository;
 import org.aura.aura.store.KbChunk;
 import org.aura.aura.util.VectorLiterals;
@@ -34,14 +35,15 @@ import static org.assertj.core.api.Assertions.assertThat;
  * Day 12's version of this test chunked the corpus, embedded it, and then ranked it with a hand-written
  * loop over an in-memory list — "brute force, on purpose", with a note that pgvector replaces it. This
  * is that replacement, and the diff is the lesson: the chunking and the embedding are unchanged and
- * have moved into {@link KbCorpusLoader}; the ranking loop is gone entirely, replaced by
+ * have moved into {@link IngestionPipeline}; the ranking loop is gone entirely, replaced by
  * {@code ORDER BY embedding <=> ?} in {@link ChunkRepository#findNearest}. The index is not magic — it
  * was always this loop, and what the database adds is that the corpus no longer has to fit in the JVM
  * or be re-embedded on every restart.
  *
  * <p>The corpus IS re-embedded on every run here, because the container is fresh each time. That is a
- * property of running a demo against a throwaway database, not of the design: the same loader against
- * the compose Postgres skips an already-populated table and costs nothing.
+ * property of running a demo against a throwaway database, not of the design: the same pipeline
+ * against the compose Postgres finds every fingerprint already current and costs zero embedding
+ * calls, which is what the first assertion below measures.
  */
 @Tag("manual")
 @ActiveProfiles("test")   // suppresses ConversationRunner (@Profile("!test")), a dev-time live Claude call
@@ -51,14 +53,13 @@ import static org.assertj.core.api.Assertions.assertThat;
                 // Opt back in to the database: application-test.yml keeps DataSourceAutoConfiguration
                 // excluded so the DB-less majority of the suite needs no Docker. See PgVectorSchemaIT.
                 "spring.autoconfigure.exclude=",
-                // Creates the KbCorpusLoader bean AND fires it: its ApplicationRunner runs during
+                // Creates the IngestionPipeline bean AND fires it: its ApplicationRunner runs during
                 // context startup, so the corpus is already ingested by the time the first test method
                 // executes. (Measured, not assumed — an earlier revision of this comment claimed
-                // runners do not fire under @SpringBootTest, and the demo's own log disproved it:
-                // "load COMPLETE — 33 chunks" during startup, then "load SKIPPED" from the explicit
-                // call below.) The test calls load() anyway, and that second call is the point: it is
-                // the skip guard demonstrating itself against a corpus that is already populated.
-                "aura.kb.load=true"
+                // runners do not fire under @SpringBootTest, and the demo's own log disproved it.)
+                // The test runs the pipeline a second time anyway, and that second run is the point:
+                // it is the idempotency proof demonstrating itself against a populated corpus.
+                "aura.ingest.enabled=true"
         })
 @Testcontainers
 class SemanticSearchDemoIT {
@@ -77,7 +78,7 @@ class SemanticSearchDemoIT {
             // that it STILL returns three ranked results with plausible-looking scores.
             "Do you sell scuba diving gear?");
 
-    @Autowired KbCorpusLoader loader;
+    @Autowired IngestionPipeline pipeline;
     @Autowired VoyageEmbeddingClient voyage;
     @Autowired ChunkRepository chunks;
     @Autowired VoyageProperties props;
@@ -89,15 +90,22 @@ class SemanticSearchDemoIT {
                         + "(the 'test' profile falls back to the dummy 'test-key' when it is absent)")
                 .isNotEqualTo("test-key");
 
-        // ---- 1. The corpus is already ingested, and this proves the guard ----------------------
+        // ---- 1. The corpus is already ingested, and this proves the idempotency ----------------
         // Chunking, embedding, and persistence all live behind one call now, and startup already made
-        // it (see the aura.kb.load note above). Calling it a second time must cost nothing: a
-        // populated table means the expensive work is done, and the loader declines to redo it.
-        KbCorpusLoader.LoadReport report = loader.load();
-        assertThat(report.skipped())
-                .as("a second load against a populated corpus must skip, not re-embed — that guard is "
-                        + "the difference between a free re-run and a billable one")
-                .isTrue();
+        // it (see the aura.ingest.enabled note above). Running it a second time must cost nothing —
+        // and unlike Day 13's all-or-nothing skip guard, "nothing" is now measured rather than
+        // asserted: every document's fingerprint matches, so the plan is empty and no batch is sent.
+        IngestReport report = pipeline.ingest();
+        assertThat(report.embeddingCalls())
+                .as("a second run against an unchanged corpus must make ZERO embedding calls — that "
+                        + "number is the difference between a free re-run and a billable one")
+                .isZero();
+        assertThat(report.attempted())
+                .as("nothing should be new or changed on an immediate re-run")
+                .isZero();
+        assertThat(report.unchanged())
+                .as("every document — the three policies plus the synthetic canary — must be unchanged")
+                .isEqualTo(4);
 
         long stored = chunks.count();
         assertThat(stored).as("the corpus must have landed in kb_chunks").isPositive();
