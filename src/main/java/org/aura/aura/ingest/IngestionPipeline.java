@@ -186,7 +186,8 @@ public class IngestionPipeline implements ApplicationRunner {
         long startedAt = System.nanoTime();
         Path corpusDir = Path.of(ingestProps.dir());
 
-        Map<String, String> content = scan(corpusDir);
+        Scan scan = scan(corpusDir);
+        Map<String, String> content = new LinkedHashMap<>(scan.byName());
         // COUNTED BEFORE the canary joins the map, and this line is the whole reason the count is a
         // variable rather than content.size() read later. The canary is synthesised, not scanned, so
         // it is always present — and a zero-docs-found guard that included it would never fire, which
@@ -208,7 +209,7 @@ public class IngestionPipeline implements ApplicationRunner {
                 plan.added().size(), plan.changed().size(), plan.unchanged().size(),
                 plan.deleted().size(), filesFound, corpusDir.toAbsolutePath(), stored.size());
 
-        guard(plan, filesFound, stored.size());
+        guard(plan, scan, stored.size(), corpusDir);
 
         List<IngestReport.Failure> failed = new ArrayList<>();
         int embeddingCalls = 0;
@@ -268,7 +269,7 @@ public class IngestionPipeline implements ApplicationRunner {
      * "found nothing" means belongs to {@link #guard}, which knows whether the store is populated.
      * Throwing here would answer that question in the wrong place and with less information.
      */
-    private Map<String, String> scan(Path corpusDir) {
+    private Scan scan(Path corpusDir) {
         Map<String, String> byName = new LinkedHashMap<>();
         try (Stream<Path> files = Files.list(corpusDir)) {
             // Sorted, so two runs on two machines process documents in the same order. Nothing
@@ -282,11 +283,37 @@ public class IngestionPipeline implements ApplicationRunner {
                             + "the working directory. Treating this as zero documents found; the guard "
                             + "below decides whether that is allowed.",
                     corpusDir.toAbsolutePath());
+            return new Scan(byName, true);
         } catch (IOException e) {
+            // Everything that is NOT absence: a path that is a file, a directory we cannot read, a
+            // failing disk. Deliberately NOT routed into the guard, because the guard's diagnosis
+            // ends in "re-run with -Daura.ingest.force=true" — advice that for a transient permissions
+            // error would be an instruction to force-delete the corpus over a disk having a bad
+            // minute. Absence is a configuration mistake with an actionable fix; this is a system
+            // fault where the configuration may be perfectly correct, and the two deserve different
+            // messages.
             throw new UncheckedIOException(
                     "cannot read the knowledge-base corpus at " + corpusDir.toAbsolutePath(), e);
         }
-        return byName;
+        return new Scan(byName, false);
+    }
+
+    /**
+     * What one scan of the corpus directory found, and — separately — whether the directory was
+     * there at all.
+     *
+     * <h2>Why the flag is carried rather than re-derived</h2>
+     * The guard needs to tell "the directory is missing" apart from "the directory is empty", and the
+     * two produce an identical {@code byName}. It could ask the filesystem again with
+     * {@code Files.isDirectory}, and that would be wrong twice: it puts I/O inside a policy method,
+     * and it re-reads state that may have changed since the scan, so the guard could refuse for a
+     * reason that was not the reason the scan saw. One observation, carried forward.
+     *
+     * @param byName           file name to raw content, for every {@code *.md} found; empty when the
+     *                         directory was empty OR absent
+     * @param directoryMissing true when {@code Files.list} reported the path does not exist
+     */
+    private record Scan(Map<String, String> byName, boolean directoryMissing) {
     }
 
     private static String read(Path path) {
@@ -317,17 +344,50 @@ public class IngestionPipeline implements ApplicationRunner {
      * with it — and a guard with no override is a guard that gets deleted the first time someone
      * needs to do the legitimate thing.
      */
-    private void guard(IngestionPlan plan, int filesFound, int storedDocuments) {
+    private void guard(IngestionPlan plan, Scan scan, int storedDocuments, Path corpusDir) {
         if (storedDocuments == 0) return;
 
-        if (filesFound == 0) {
+        if (scan.directoryMissing()) {
+            // THE ONE GUARD force CANNOT OVERRIDE, and the asymmetry is the whole decision.
+            //
+            // force=true means "yes, I looked, and I mean to delete those documents". That sentence
+            // has a subject only when there was something to look at. A path that does not exist is
+            // indistinguishable from a typo, an unmounted volume, or a container started without its
+            // bind mount — and in none of those cases did anyone look at anything. Honouring force
+            // here would let a one-character error in aura.ingest.dir empty the knowledge base while
+            // the operator believed they were authorising a curation they had reviewed.
+            //
+            // The empty directory is what makes intent expressible. Creating one is an affirmative
+            // act that cannot happen by typo, so `mkdir` + force is a two-step declaration where the
+            // steps fail independently: the typo'd path stops at this guard, and the reviewed
+            // deletion proceeds. That is why the fix below is an instruction and not an apology.
+            throw new IngestionRefusedException("ingestion REFUSED — the corpus directory "
+                    + corpusDir.toAbsolutePath() + " DOES NOT EXIST, and the ledger holds "
+                    + storedDocuments + " document(s). aura.ingest.force does NOT apply to this case "
+                    + "and setting it will not change this outcome. force is how an operator states "
+                    + "'I have looked at the corpus and I mean to delete these documents' — a claim "
+                    + "that cannot be true about a directory nobody can open, because a missing path "
+                    + "is what a typo, an unmounted volume and a container without its bind mount all "
+                    + "look like. If you genuinely intend to remove every document: create the "
+                    + "directory empty (mkdir -p " + corpusDir + ") and re-run with "
+                    + "-Daura.ingest.force=true. The empty directory IS the declaration of intent that "
+                    + "a missing one cannot be. Nothing has been written.");
+        }
+
+        if (scan.byName().isEmpty()) {
+            // The directory exists and holds no markdown. Still the shape of a mistake — a wrong
+            // working directory that happens to point somewhere real, a corpus not yet checked out —
+            // so it still refuses by default. But someone stood the directory up, which is enough of
+            // a deliberate act for force to mean something, so force is honoured here.
+            //
             // Checked SEPARATELY from the ratio below even though a zero scan usually trips that too.
             // "Usually" is the problem: with one document in the ledger, deleting it is 1 of 1, and
             // `1 > 0.5` holds — but the message would then blame a ratio when the actual finding is
-            // that the corpus directory is empty or wrong. Two rules, two diagnoses.
-            refuseUnlessForced("found NO markdown files, but the ledger holds " + storedDocuments
-                    + " document(s). This is what a wrong working directory, an unmounted volume or a "
-                    + "renamed corpus folder looks like, and carrying on would delete the entire "
+            // that the corpus directory is empty. Two rules, two diagnoses.
+            refuseUnlessForced("found NO markdown files in " + corpusDir.toAbsolutePath()
+                    + ", but the ledger holds " + storedDocuments + " document(s). The directory "
+                    + "exists and is empty, which is what a wrong working directory or a corpus that "
+                    + "was never checked out looks like, and carrying on would delete the entire "
                     + "knowledge base");
             return;
         }
