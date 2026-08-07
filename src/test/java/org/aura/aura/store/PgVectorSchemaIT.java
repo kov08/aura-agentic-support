@@ -97,10 +97,11 @@ class PgVectorSchemaIT {
         assertThat(applied)
                 .as("V1 (extension), V2 (kb_chunks) and V3 (kb_documents + the FK) must all be "
                         + "recorded as applied")
-                .hasSize(3);
+                .hasSize(4);
         assertThat(applied.get(0)).containsEntry("version", "1").containsEntry("success", true);
         assertThat(applied.get(1)).containsEntry("version", "2").containsEntry("success", true);
-        assertThat(applied.get(2)).containsEntry("version", "3").containsEntry("success", true);
+        assertThat(applied.get(2)).containsEntry("version", "3").containsEntry("success", true);
+        assertThat(applied.get(3)).containsEntry("version", "4").containsEntry("success", true);
 
         // V1's actual effect, checked directly — a migration recorded as successful and an extension
         // that is actually enabled are two different claims.

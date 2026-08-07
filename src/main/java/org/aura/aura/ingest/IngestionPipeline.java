@@ -8,10 +8,12 @@ import org.aura.aura.config.EmbeddingProperties;
 import org.aura.aura.config.IngestionProperties;
 import org.aura.aura.config.VoyageProperties;
 import org.aura.aura.domain.Chunk;
+import org.aura.aura.store.CanaryProbeRepository;
 import org.aura.aura.store.ChunkRepository;
 import org.aura.aura.store.DocumentRepository;
 import org.aura.aura.store.KbChunk;
 import org.aura.aura.store.KbDocument;
+import org.aura.aura.util.VectorLiterals;
 import org.springframework.boot.ApplicationArguments;
 import org.springframework.boot.ApplicationRunner;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
@@ -51,14 +53,18 @@ import java.util.stream.Stream;
  *          per DELETED doc:                                 [ remove in one transaction ]
  * </pre>
  *
- * <h2>The canary rides the same rails</h2>
+ * <h2>The canary rides the same rails, and lands somewhere else</h2>
  * {@link CanaryDocument} is a synthetic document with no file behind it, and it is deliberately NOT
- * special-cased above the chunker: it is fingerprinted by the same function, diffed by the same plan,
- * tracked by its own {@code kb_documents} row, and committed by the same per-document transaction.
- * That fate-sharing is what keeps the guard honest — a canary on a private code path is a canary that
- * can quietly stop being maintained by the machinery it exists to watch. The one thing that differs
- * is that it bypasses {@link DocumentChunker} (see {@link #chunksOf}), because a chunker that derives
- * breadcrumbs from headings would rewrite the frozen text's embedding input.
+ * special-cased anywhere above the write itself: it is fingerprinted by the same function, diffed by
+ * the same plan, tracked by its own {@code kb_documents} row, and committed by the same per-document
+ * transaction. That fate-sharing is what keeps the guard honest — a canary on a private code path is
+ * a canary that can quietly stop being maintained by the machinery it exists to watch.
+ *
+ * <p>Exactly two things differ, and both are one line. It bypasses {@link DocumentChunker} (see
+ * {@link #chunksOf}), because a chunker that derives breadcrumbs from headings would rewrite the
+ * frozen text's embedding input. And its vector is upserted into {@code canary_probe} instead of
+ * {@code kb_chunks} (see {@link #swap}), because {@code kb_chunks} is the retrieval corpus and a
+ * measuring instrument does not belong in the population it measures.
  *
  * <h2>Programmatic transactions, and why {@code @Transactional} would not work here</h2>
  * The per-document swap has to be atomic: delete the old chunks, insert the new ones, advance the
@@ -126,6 +132,7 @@ public class IngestionPipeline implements ApplicationRunner {
     private final VoyageEmbeddingClient voyage;
     private final ChunkRepository chunks;
     private final DocumentRepository documents;
+    private final CanaryProbeRepository probe;
     private final VoyageProperties voyageProps;
     private final EmbeddingProperties embeddingProps;
     private final IngestionProperties ingestProps;
@@ -135,6 +142,7 @@ public class IngestionPipeline implements ApplicationRunner {
                              VoyageEmbeddingClient voyage,
                              ChunkRepository chunks,
                              DocumentRepository documents,
+                             CanaryProbeRepository probe,
                              VoyageProperties voyageProps,
                              EmbeddingProperties embeddingProps,
                              IngestionProperties ingestProps,
@@ -143,6 +151,7 @@ public class IngestionPipeline implements ApplicationRunner {
         this.voyage = voyage;
         this.chunks = chunks;
         this.documents = documents;
+        this.probe = probe;
         this.voyageProps = voyageProps;
         this.embeddingProps = embeddingProps;
         this.ingestProps = ingestProps;
@@ -418,25 +427,46 @@ public class IngestionPipeline implements ApplicationRunner {
             log.debug("ingestion swap — removed {} existing chunk(s) for {}", removed, path);
         }
 
-        UUID documentId = document.getId();
-        List<KbChunk> rows = new ArrayList<>(docChunks.size());
-        for (int i = 0; i < docChunks.size(); i++) {
-            Chunk chunk = docChunks.get(i);
-            rows.add(new KbChunk(
-                    UUID.randomUUID(),
-                    documentId,
-                    chunk.sourceDoc(),
-                    chunk.position(),
-                    chunk.breadcrumb(),
-                    chunk.text(),
-                    estimateTokens(chunk.embeddingInput()),
-                    vectors.get(i),
-                    // Stamped from the SAME config that routed the embedding call, in the same run —
-                    // not from a constant, and not re-read later. That is what makes the stored model
-                    // name a fact about this row rather than a guess about the deployment.
-                    modelId));
+        // THE ONE BRANCH. Everything around it is identical for the canary and for a policy
+        // document — the same scan produced them, the same fingerprint function judged them, the same
+        // plan scheduled them, the same ledger row tracks them, and this same transaction commits
+        // them. Only the DESTINATION of the vectors differs, because only the destination should:
+        // kb_chunks is the retrieval corpus and the canary is not a candidate answer.
+        //
+        // Keeping the branch this narrow is deliberate. A canary that took a separate code path would
+        // be a canary that stops being exercised by the machinery it is supposed to be watching — it
+        // could silently stop being planned, stop being fingerprinted, or stop sharing a transaction,
+        // and nothing would notice until the guard was needed.
+        if (CanaryDocument.PATH.equals(path)) {
+            if (docChunks.size() != 1) {
+                // Structurally impossible today — chunksOf returns List.of(CanaryDocument.chunk()) —
+                // and asserted anyway because the failure is silent: getFirst() would pick one vector
+                // out of several and the probe would measure against an arbitrary fragment.
+                throw new IllegalStateException("the canary must produce exactly one chunk, got "
+                        + docChunks.size());
+            }
+            probe.upsert(VectorLiterals.toLiteral(vectors.getFirst()), modelId);
+        } else {
+            UUID documentId = document.getId();
+            List<KbChunk> rows = new ArrayList<>(docChunks.size());
+            for (int i = 0; i < docChunks.size(); i++) {
+                Chunk chunk = docChunks.get(i);
+                rows.add(new KbChunk(
+                        UUID.randomUUID(),
+                        documentId,
+                        chunk.sourceDoc(),
+                        chunk.position(),
+                        chunk.breadcrumb(),
+                        chunk.text(),
+                        estimateTokens(chunk.embeddingInput()),
+                        vectors.get(i),
+                        // Stamped from the SAME config that routed the embedding call, in the same run
+                        // — not from a constant, and not re-read later. That is what makes the stored
+                        // model name a fact about this row rather than a guess about the deployment.
+                        modelId));
+            }
+            chunks.saveAll(rows);
         }
-        chunks.saveAll(rows);
 
         // LAST. The fingerprint is the pipeline's only record that this document's work is done, so
         // it must be the last thing to become true. Advancing it earlier and failing afterwards would

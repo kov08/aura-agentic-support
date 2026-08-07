@@ -6,7 +6,6 @@ import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
 import java.util.List;
-import java.util.Optional;
 import java.util.UUID;
 
 /**
@@ -112,35 +111,10 @@ public interface ChunkRepository extends JpaRepository<KbChunk, UUID> {
     @Query("DELETE FROM KbChunk c WHERE c.documentId = :documentId")
     int deleteByDocumentId(@Param("documentId") UUID documentId);
 
-    /**
-     * The canary row, addressed by the identity the schema already declares unique
-     * ({@code source_doc, chunk_index}) rather than by its uuid.
-     *
-     * <p>The uuid would be the obvious key and is the wrong one: the ingestion pipeline assigns
-     * {@code UUID.randomUUID()} to every chunk it writes, so it changes on every rebuild. A canary
-     * pinned to a value that changes whenever the corpus is re-ingested is a canary that fails for
-     * the one reason it is not meant to detect.
-     */
-    Optional<KbChunk> findBySourceDocAndChunkIndex(String sourceDoc, int chunkIndex);
-
-    /**
-     * The cosine distance between one stored chunk's embedding and a supplied query vector —
-     * measured by Postgres, with the same operator the ranked search uses.
-     *
-     * <p>The canary could have computed this in the JVM with {@link org.aura.aura.util.VectorMath}
-     * and one fewer round-trip. It does not, and that is the point of the guard: the number the
-     * canary compares against a pre-registered band has to be measured on the SAME arithmetic every
-     * customer query is ranked by, or the band is calibrated against something no request rides.
-     *
-     * @return empty when no row carries that identity — the caller decides whether that is a
-     *         not-yet-ingested corpus (benign) or a drifted canary (not)
-     */
-    @Query(value = """
-            SELECT embedding <=> CAST(:queryVector AS vector)
-            FROM kb_chunks
-            WHERE source_doc = :sourceDoc AND chunk_index = :chunkIndex
-            """, nativeQuery = true)
-    Optional<Double> distanceFrom(@Param("sourceDoc") String sourceDoc,
-                                  @Param("chunkIndex") int chunkIndex,
-                                  @Param("queryVector") String queryVector);
+    // NOTE (V4) — findBySourceDocAndChunkIndex and distanceFrom used to sit here, and both existed
+    // solely for RetrievalCanaryCheck. They went with the canary when its vector moved out of this
+    // table into canary_probe. Deleting them rather than keeping them "in case" is the point: a
+    // lookup into the retrieval corpus by (source_doc, chunk_index) plus a distance measured against
+    // one such row is precisely the toolkit that would let the canary drift back in here. See
+    // CanaryProbeRepository, where both now live against a table retrieval never reads.
 }
