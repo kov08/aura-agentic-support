@@ -17,7 +17,9 @@ import org.aura.aura.resolver.ResolutionStatus;
 import org.aura.aura.resolver.ResolverOutput;
 import org.aura.aura.retrieval.SourceRef;
 import org.aura.aura.store.ChunkRepository;
+import org.aura.aura.store.DocumentRepository;
 import org.aura.aura.store.KbChunk;
+import org.aura.aura.store.KbFixtures;
 import org.aura.aura.web.dto.ResolveTicketRequest;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -84,6 +86,7 @@ class RagResolutionIT extends PostgresBackedContext {
 
     @Autowired CachedResolutionService resolutions;
     @Autowired ChunkRepository chunks;
+    @Autowired DocumentRepository documents;
     @Autowired JdbcTemplate jdbc;
 
     /**
@@ -94,8 +97,12 @@ class RagResolutionIT extends PostgresBackedContext {
      * independent of the order JUnit happens to pick.
      */
     @org.junit.jupiter.api.AfterAll
-    static void clearSharedCorpus(@Autowired ChunkRepository chunks) {
+    static void clearSharedCorpus(@Autowired ChunkRepository chunks,
+                                  @Autowired DocumentRepository documents) {
         chunks.deleteAllInBatch();
+        // The parent rows go too, or the next class in the shared container inherits a ledger
+        // describing a corpus that is no longer there.
+        documents.deleteAllInBatch();
     }
 
     @BeforeEach
@@ -245,8 +252,12 @@ class RagResolutionIT extends PostgresBackedContext {
      * uniform so the packing outcome is decided by the ranking and the dedup rule rather than by an
      * accident of chunk sizes.
      */
-    private static KbChunk chunk(String doc, int index, String breadcrumb, String content, float[] vector) {
-        return new KbChunk(UUID.randomUUID(), doc, index, breadcrumb, content, 300, vector, "voyage-4-large");
+    private KbChunk chunk(String doc, int index, String breadcrumb, String content, float[] vector) {
+        // Day 15: kb_chunks.document_id is a NOT NULL foreign key, so the parent row has to exist and
+        // be flushed before this chunk can be inserted. Non-static now for exactly that reason — it
+        // needs the repository.
+        return new KbChunk(UUID.randomUUID(), KbFixtures.documentId(documents, doc), doc, index,
+                breadcrumb, content, 300, vector, "voyage-4-large");
     }
 
     /** 1 on one axis, 0 elsewhere. Against unit(0): distance 0 for axis 0, distance 1 for any other. */
