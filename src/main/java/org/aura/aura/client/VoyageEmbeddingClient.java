@@ -12,6 +12,7 @@ import org.springframework.web.client.ResourceAccessException;
 import org.springframework.web.client.RestClient;
 import org.springframework.web.client.RestClientException;
 
+import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 
@@ -56,6 +57,38 @@ public class VoyageEmbeddingClient {
 
     private static final String EMBEDDINGS_PATH = "/v1/embeddings";
 
+    /**
+     * Inputs per request. The provider's documented ceiling is <b>1,000</b>; this is 128.
+     *
+     * <p>The gap is not timidity, it is blast radius. A batch is one retry unit and one failure unit:
+     * a 429 on a 1,000-input request re-sends 1,000 inputs, and a permanent failure loses all of them.
+     * It is also one memory unit — 1,000 × 1,024 floats is 4MB of vectors held while the response is
+     * parsed. 128 keeps a full document in one call for anything under ~250KB of markdown while
+     * keeping each failure cheap.
+     */
+    static final int MAX_INPUTS_PER_CALL = 128;
+
+    /**
+     * Estimated tokens per request. The provider's cap is <b>per model</b>: 120K for
+     * {@code voyage-4-large} (and the other large/domain models), 320K for {@code voyage-4}, 1M for
+     * the {@code -lite} models.
+     *
+     * <p>60K is half of the TIGHTEST of those, and the tightest is the one that matters because this
+     * method runs the DOCUMENT lane — which is {@code voyage-4-large}. Sizing against the model
+     * actually configured would be more precise and would turn a config change into a silent
+     * over-cap: point {@code voyage.document-model} at a model with a smaller budget and a batch that
+     * used to fit starts failing whole. One conservative number, chosen against the worst case we can
+     * be pointed at, has no such edge.
+     *
+     * <p>The 2× margin pays for the estimate being an estimate. The ~4-chars-per-token proxy
+     * UNDER-counts for anything dense in punctuation, code, or non-Latin script — precisely the
+     * content whose real token count could overshoot — so the headroom absorbs a tokenizer that
+     * disagrees with us by up to a factor of two before the provider does the rejecting.
+     */
+    static final int MAX_ESTIMATED_TOKENS_PER_CALL = 60_000;
+
+    private static final int CHARS_PER_TOKEN = 4;
+
     private final RestClient http;
     private final VoyageProperties props;
 
@@ -89,6 +122,103 @@ public class VoyageEmbeddingClient {
     @Retry(name = VOYAGE)
     public List<float[]> embedDocuments(List<String> inputs) {
         return embed(inputs, props.documentModel(), documentInputType());
+    }
+
+    /**
+     * The OFFLINE lane, batched: embed an arbitrary number of chunk texts, splitting them into as
+     * many HTTP requests as the provider's caps require.
+     *
+     * <p>{@link #embedDocuments} takes whatever list it is handed and sends it as ONE request, which
+     * makes the caller responsible for knowing the caps. That was tolerable when the only caller was
+     * a loader with a hardcoded 64 and a corpus of three files. It is the wrong contract for a
+     * pipeline whose input size is "however many chunks a document happens to have", so the knowledge
+     * moves here — to the class that already knows which model it is calling and therefore which cap
+     * applies.
+     *
+     * @return the vectors, one per input, in INPUT ORDER across batch boundaries — plus the number of
+     *         HTTP calls that produced them, which is what {@link org.aura.aura.ingest.IngestReport}
+     *         turns into the idempotency proof
+     */
+    @Retry(name = VOYAGE)
+    public BatchedEmbeddings embedBatched(List<String> inputs) {
+        List<List<String>> batches = batches(inputs);
+
+        List<float[]> vectors = new ArrayList<>(inputs.size());
+        for (List<String> batch : batches) {
+            // The PRIVATE core, not this.embedDocuments(...) — and that is not a shortcut, it is the
+            // self-invocation trap being avoided rather than walked into. @Retry works by an AOP
+            // proxy that wraps this bean from the outside, so it only intercepts calls that cross the
+            // bean boundary; `this.embedDocuments(batch)` never leaves the object, the proxy never
+            // sees it, and the annotation would silently do nothing. Exactly the mechanism that makes
+            // @Transactional useless on a self-called method, which is why IngestionPipeline uses
+            // TransactionTemplate instead of annotating its per-document loop.
+            //
+            // So the retry lives on THIS method, where an external caller does cross the proxy. The
+            // consequence is that the retry unit is the whole call rather than one batch: a transient
+            // failure on batch 3 re-sends batches 1 and 2 as well. Accepted, with eyes open — a
+            // knowledge-base document chunks to single digits and is therefore one batch in practice,
+            // so the two policies are the same policy at this corpus's document sizes. The document
+            // that makes them differ would need ~128 chunks, i.e. roughly 250KB of markdown in one
+            // file, and the fix then is to split the file, not to complicate this.
+            vectors.addAll(embed(batch, props.documentModel(), documentInputType()));
+        }
+
+        if (vectors.size() != inputs.size()) {
+            // Unreachable unless embed() breaks its own contract, which it already checks. Asserted
+            // again because the failure it guards is invisible: every chunk paired with a neighbour's
+            // vector loads cleanly, queries cleanly, and cites the wrong passage forever.
+            throw new IllegalStateException("batched embedding returned " + vectors.size()
+                    + " vectors for " + inputs.size() + " inputs");
+        }
+        return new BatchedEmbeddings(List.copyOf(vectors), batches.size());
+    }
+
+    /**
+     * The result of {@link #embedBatched}: the vectors, and what they cost in round-trips.
+     *
+     * @param vectors one per input, in input order
+     * @param calls   HTTP requests actually issued on the attempt that succeeded. Retries are not
+     *                counted — see {@code IngestReport.embeddingCalls} for why the number is defined
+     *                that way
+     */
+    public record BatchedEmbeddings(List<float[]> vectors, int calls) {
+    }
+
+    /**
+     * Splits inputs into request-sized batches. Package-private and static so the sizing rule can be
+     * unit-tested as arithmetic, with no client, no properties and no HTTP.
+     *
+     * <p>Greedy: keep adding to the current batch until the next input would breach either cap, then
+     * start a new one. An input that on its own exceeds the token budget still gets sent — alone —
+     * because the alternative is silently dropping it, and the chunker has already capped chunk size
+     * far below anything that could realistically hit this.
+     */
+    static List<List<String>> batches(List<String> inputs) {
+        List<List<String>> batches = new ArrayList<>();
+        List<String> current = new ArrayList<>();
+        int tokens = 0;
+
+        for (String input : inputs) {
+            int cost = estimateTokens(input);
+            boolean wouldBreach = current.size() >= MAX_INPUTS_PER_CALL
+                    || tokens + cost > MAX_ESTIMATED_TOKENS_PER_CALL;
+            if (!current.isEmpty() && wouldBreach) {
+                batches.add(List.copyOf(current));
+                current.clear();
+                tokens = 0;
+            }
+            current.add(input);
+            tokens += cost;
+        }
+        if (!current.isEmpty()) batches.add(List.copyOf(current));
+        return List.copyOf(batches);
+    }
+
+    // Ceiling division on the SAME ~4-characters-per-token English proxy the chunker uses for its
+    // size cap and kb_chunks.token_count records. It is an approximation, and the safety factor on
+    // MAX_ESTIMATED_TOKENS_PER_CALL is what pays for it being one.
+    private static int estimateTokens(String text) {
+        return Math.ceilDiv(text.length(), CHARS_PER_TOKEN);
     }
 
     /**
