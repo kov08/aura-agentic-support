@@ -4,6 +4,7 @@ import com.anthropic.client.AnthropicClient;
 import com.anthropic.client.okhttp.AnthropicOkHttpClient;
 import org.aura.aura.config.CanaryProperties;
 import org.aura.aura.config.EmbeddingProperties;
+import org.aura.aura.config.IngestionProperties;
 import org.aura.aura.config.RetrievalProperties;
 import org.aura.aura.config.VoyageProperties;
 import org.springframework.boot.SpringApplication;
@@ -22,8 +23,13 @@ import org.springframework.context.annotation.Bean;
 // CanaryProperties (the boot-time geometry probe). Same pattern again: the parts of each contract
 // that are answerable from configuration alone are JSR-303 annotations here, and the part that needs
 // a live database and a live Voyage call is RetrievalCanaryCheck.
+// Day 15 adds IngestionProperties — the corpus pipeline's switches. Same pattern once more: the
+// contract that configuration alone can settle (a non-blank corpus directory) is a JSR-303
+// annotation here, and the part that needs the filesystem and the ledger in front of it is
+// IngestionPipeline's guard, which refuses a destructive plan at run time rather than at binding time.
 @EnableConfigurationProperties({AnthropicProperties.class, VoyageProperties.class,
-        EmbeddingProperties.class, RetrievalProperties.class, CanaryProperties.class})
+        EmbeddingProperties.class, RetrievalProperties.class, CanaryProperties.class,
+        IngestionProperties.class})
 public class AuraApplication {
 
     public static void main(String[] args) {

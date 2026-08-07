@@ -38,8 +38,8 @@ spring:
   #   opinion about our latency budget.
   #
   # FINDING 2 — 30s to WAIT FOR A CONNECTION is a batch-shaped number on a customer-facing read.
-  #   It is a reasonable value for KbCorpusLoader, which would rather queue than fail halfway through
-  #   a billable embedding run. It is a poor one for a ticket: nobody is helped by a resolution that
+  #   It is a reasonable value for a batch ingestion pass, which would rather queue than fail halfway
+  #   through a billable embedding run. It is a poor one for a ticket: nobody is helped by a resolution that
   #   arrives after half a minute of pool starvation, and a request that fails fast can degrade,
   #   while one that blocks holds a servlet thread the whole time.
   #
@@ -99,10 +99,15 @@ spring:
         # never on a slow-but-working query.
         #
         # SCOPE WORTH NAMING: this applies to EVERY statement on this DataSource, including the
-        # ingestion path. Today that is fine — KbCorpusLoader writes 33 rows in small batches — but
-        # a Day 15 ingester with a genuinely long-running statement would be killed at 2s. When that
-        # lands it needs its own DataSource or its own bound, not a relaxed value here, because
-        # relaxing it here silently un-bounds the customer path again.
+        # ingestion path. Day 15 has now landed and the bound still holds, for a reason worth
+        # recording rather than re-deriving: IngestionPipeline's unit of work is ONE DOCUMENT — a
+        # bulk delete of a handful of chunk rows, then an insert of a handful more — and the long
+        # part of ingestion is the Voyage call, which is deliberately made OUTSIDE the transaction.
+        # No single statement it issues comes close to 2s.
+        #
+        # The warning it replaces still stands for whatever comes next: an ingester with a genuinely
+        # long-running statement needs its own DataSource or its own bound, not a relaxed value here,
+        # because relaxing it here silently un-bounds the customer path again.
         socketTimeout: 2
 
   jpa:
@@ -153,13 +158,31 @@ aura:
   embedding:
     dimension: 1024
 
-  # The one-shot corpus loader (KbCorpusLoader). OFF by default, because it is a billable, minutes-long
-  # ingestion pass that has no business running on an ordinary application start.
-  #   ./mvnw spring-boot:run -Daura.kb.load=true
-  kb:
-    load: false
-    dir: kb              # the corpus directory, resolved relative to the working directory
-    force-reload: false  # re-ingest even when kb_chunks is already populated (wipes it first)
+  # --- Day 15: the incremental ingestion pipeline ------------------------------------------------
+  # Replaces Day 13's KbCorpusLoader, which had exactly two behaviours — skip everything, or wipe the
+  # table and re-embed everything — because the only question it could ask the database was "are
+  # there any rows?". kb_documents now records a fingerprint per document, so the question becomes
+  # per-document and the answer becomes a plan.
+  #
+  #   ./mvnw spring-boot:run -Daura.ingest.enabled=true
+  #
+  # STILL OFF BY DEFAULT, and for a weaker reason than before. The first run is billable and
+  # minutes-long; every run after it over an unchanged corpus costs zero embedding calls and a
+  # handful of SELECTs, so leaving it on would be nearly free. It stays off because "nearly free" is
+  # a property of the steady state, and the run that is NOT in the steady state — the one after a
+  # model change, which re-embeds the whole corpus — is the one that would fire unattended.
+  #
+  # The trigger is an ApplicationRunner, not an admin REST endpoint. An endpoint would be more
+  # convenient and it is deliberately parked: an unauthenticated endpoint that can rewrite the
+  # knowledge base is a guardrails problem, and this application has no authentication until Day 18.
+  ingest:
+    enabled: false
+    dir: kb        # the corpus directory, resolved relative to the working directory
+    # The override for the destructive-plan guards (delete >50% of the ledger; find zero markdown
+    # files while the ledger is populated). It belongs on a command line, never in a committed file:
+    # the guards exist to catch a wrong working directory, and a config that permanently disables
+    # them is a config that catches nothing. The pipeline logs at WARN every time this is honoured.
+    force: false
 
   # --- Day 14 (Decisions 2 + 3): retrieval policy ------------------------------------------------
   retrieval:
@@ -222,9 +245,25 @@ aura:
   canary:
     enabled: true
     # The canary chunk, addressed by the identity kb_chunks already declares unique. NOT by uuid:
-    # KbCorpusLoader assigns a random one per ingest, so a uuid-pinned canary would fail on every
-    # reload for the one reason it is not meant to detect.
-    source-doc: refund-policy.md
+    # the pipeline assigns a random one on every rebuild, so a uuid-pinned canary would fail on every
+    # re-ingest for the one reason it is not meant to detect.
+    #
+    # DAY 15 REPOINTED THIS from refund-policy.md#0 to a synthetic document, and the reason is a
+    # consequence of ingestion becoming automatic. Until today the corpus only changed when a human
+    # edited a file and re-ran a loader by hand. Now the pipeline rebuilds a document's chunks the
+    # moment its fingerprint moves — so an editor adding one sentence to the top of refund-policy.md
+    # silently changes what chunk 0 SAYS, and this guard then refuses the next boot, correctly
+    # reporting an out-of-band distance, for a reason that has nothing to do with the embedding space
+    # it exists to watch. A tripwire that fires on ordinary policy edits is a tripwire that gets
+    # switched off.
+    #
+    # org.aura.aura.canary.CanaryDocument holds the text as a constant instead: byte-for-byte what
+    # refund-policy.md chunk 0 held when the band below was measured, so the measurement carries over
+    # rather than needing a re-run, and changing it is now a code review instead of a policy edit.
+    # The costs of that choice (a duplicated chunk in the retrieval corpus; the band's validity being
+    # an empirical question on the first Day 15 boot rather than a proof) are written out on that
+    # class.
+    source-doc: __canary__
     chunk-index: 0
     # MEASURED 2026-08-04 by CanaryBandHarnessIT. n=20 fresh voyage-4-lite/query embeddings of the
     # canary chunk's exact embedding input, each compared by Postgres against the stored
