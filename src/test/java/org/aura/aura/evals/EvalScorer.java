@@ -113,7 +113,39 @@ public final class EvalScorer {
                     + "that relabel and restoring the gradeSources call in EvalScorer.score; the "
                     + "grading rules themselves are intact and still unit-tested.";
 
+    /**
+     * Whether the pipeline that produced a {@link Resolution} enforces citations at all.
+     *
+     * <h2>Why the scorer has to be told, rather than inferring it</h2>
+     * The citation checks below are a tripwire on G4, and a tripwire only means something where the
+     * gate is supposed to be running. The Day 16 before/after experiment replays the PRE-grounding
+     * resolver, whose schema had no {@code citations} field — so every one of its answers has an empty
+     * cited list, always, for a reason that has nothing to do with its judgment.
+     *
+     * <p>Left on, the tripwire would score every single before-arm answer as a hallucination,
+     * including the ones that stated the corpus's value correctly and avoided the trap. The before
+     * column's hallucination rate would then be ~100% by construction and the after arm would look
+     * spectacular against a baseline that was penalised for lacking a feature it never had. That is
+     * not a measurement, it is a rigged comparison — and the fact that it would produce a flattering
+     * number is exactly why it needs saying in code rather than being left to whoever reads the
+     * report.
+     *
+     * <p>Inferring it from "the cited list is empty" is not an option either: an empty list is also
+     * precisely what a BROKEN G4 produces, and those two must not collapse into one reading.
+     */
+    public enum CitationRegime {
+        /** Today's pipeline: G4 ran, so an uncited answer is a finding. */
+        ENFORCED,
+        /** A replay of a resolver that had no citations to give. Citation checks are skipped. */
+        ABSENT
+    }
+
     public TicketScore score(EvalTicket ticket, ClassificationResult classification, Resolution resolution) {
+        return score(ticket, classification, resolution, CitationRegime.ENFORCED);
+    }
+
+    public TicketScore score(EvalTicket ticket, ClassificationResult classification,
+                             Resolution resolution, CitationRegime regime) {
         ExpectedResult expected = ticket.expected();
 
         boolean classifierDegraded = classification.reason() == ReviewReason.DEPENDENCY_UNAVAILABLE;
@@ -155,7 +187,7 @@ public final class EvalScorer {
 
         TicketScore.GroundingResult grounding = resolverDegraded
                 ? TicketScore.GroundingResult.notApplicable()
-                : gradeGrounding(ticket, resolution);
+                : gradeGrounding(ticket, resolution, regime);
 
         boolean classifierOk = classifierDegraded
                 || (Boolean.TRUE.equals(categoryMatch)
@@ -193,7 +225,8 @@ public final class EvalScorer {
      * ("I don't have that…"), because a model that hedges its way to a non-answer while sounding
      * confident would score as an answer, and that is the failure most worth catching.
      */
-    private TicketScore.GroundingResult gradeGrounding(EvalTicket ticket, Resolution resolution) {
+    private TicketScore.GroundingResult gradeGrounding(EvalTicket ticket, Resolution resolution,
+                                                       CitationRegime regime) {
         Optional<GroundingClass> maybeClass = GroundingClass.of(ticket.slice());
         if (maybeClass.isEmpty()) return TicketScore.GroundingResult.notApplicable();
         GroundingClass groundingClass = maybeClass.get();
@@ -242,10 +275,20 @@ public final class EvalScorer {
                             .map(TicketScore.RuleViolation::fragment).toList());
         }
 
-        // CITATION CHECKS. The subset half is a TRIPWIRE, not a measurement: G4 already guarantees it
-        // in production code, so it can only fire if a future refactor breaks the gate. That is
-        // exactly why it is worth an assertion here — a gate nothing observes is a gate that can be
-        // removed by accident, and the eval is the only place that watches the pipeline from outside.
+        // CITATION CHECKS, and everything from here down is SKIPPED for a pipeline that never had
+        // citations to give (see CitationRegime). Reaching this point means the answer stated the
+        // corpus's value and carried no generic-prior language — which is the whole of what the
+        // before arm can be judged on.
+        if (regime == CitationRegime.ABSENT) {
+            return new TicketScore.GroundingResult(groundingClass,
+                    TicketScore.GroundingResult.Outcome.GROUNDED, true,
+                    "stated the corpus value; citations not graded (pre-grounding pipeline)");
+        }
+
+        // The subset half is a TRIPWIRE, not a measurement: G4 already guarantees it in production
+        // code, so it can only fire if a future refactor breaks the gate. That is exactly why it is
+        // worth an assertion here — a gate nothing observes is a gate that can be removed by
+        // accident, and the eval is the only place that watches the pipeline from outside.
         List<String> cited = citedBreadcrumbs(resolution);
         List<String> provided = resolution.sourcesProvided().stream().map(SourceRef::breadcrumb).toList();
         if (cited.isEmpty()) {

@@ -554,6 +554,52 @@ class EvalScorerTest {
         assertThat(s.grounding().reason()).contains("not retrieved");
     }
 
+    /**
+     * THE BEFORE-ARM RULE, and the one place a wrong default would have produced a flattering lie.
+     *
+     * <p>Under {@code CitationRegime.ABSENT} the same uncited answer that is a broken-gate finding
+     * above is simply GROUNDED, because the pipeline being replayed had no citations to give. Without
+     * this, the Day 16 before/after report would score every correct pre-grounding answer as a
+     * hallucination and the after arm would win against a baseline penalised for lacking a feature it
+     * never had.
+     */
+    @Test
+    void underTheAbsentCitationRegime_anUncitedButCorrectAnswerIsGrounded() {
+        EvalTicket ticket = groundingTicket("trap", List.of("7"), List.of("non-refundable"),
+                List.of(GIFT_CARDS));
+        Resolution uncited = answered("Gift cards can be refunded within 7 days.",
+                List.of(GIFT_CARDS), List.of());
+
+        assertThat(scorer.score(ticket, goodClassification(), uncited,
+                        EvalScorer.CitationRegime.ABSENT).grounding().outcome())
+                .isEqualTo(TicketScore.GroundingResult.Outcome.GROUNDED);
+        // ...and the SAME response under today's pipeline is still a finding. One input, two regimes,
+        // two correct answers — which is why the regime is a parameter rather than a heuristic.
+        assertThat(scorer.score(ticket, goodClassification(), uncited,
+                        EvalScorer.CitationRegime.ENFORCED).grounding().outcome())
+                .isEqualTo(TicketScore.GroundingResult.Outcome.HALLUCINATED);
+    }
+
+    // The checks that DON'T depend on citations still apply to the before arm — otherwise the regime
+    // would be an amnesty rather than a scope.
+    @Test
+    void theAbsentRegimeStillCatchesPriorLeaksAndMissingFacts() {
+        EvalTicket trap = groundingTicket("trap", List.of("7"), List.of("non-refundable"),
+                List.of(GIFT_CARDS));
+
+        assertThat(scorer.score(trap, goodClassification(),
+                        answered("Gift cards are non-refundable.", List.of(GIFT_CARDS), List.of()),
+                        EvalScorer.CitationRegime.ABSENT).grounding().outcome())
+                .isEqualTo(TicketScore.GroundingResult.Outcome.HALLUCINATED);
+
+        assertThat(scorer.score(
+                        groundingTicket("unanswerable", List.of(), List.of(), null),
+                        goodClassification(),
+                        answered("We offer 10% off for students.", List.of(OTHER_CHUNK), List.of()),
+                        EvalScorer.CitationRegime.ABSENT).grounding().outcome())
+                .isEqualTo(TicketScore.GroundingResult.Outcome.HALLUCINATED);
+    }
+
     // The 24 pre-Day-16 tickets carry no claim about what the corpus contains, so grading them here
     // would be inventing a label rather than reading one.
     @Test

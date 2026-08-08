@@ -119,8 +119,16 @@ class GroundingBeforeAfterRunner extends org.aura.aura.PostgresBackedContext {
             // the comparison is between two experiments rather than two prompts.
             ContextBlock context = retrieval.retrieve(ticket.customerMessage());
 
-            after.add(arm(ticket, resolver.resolve(ticket.customerMessage(), context)));
-            before.add(arm(ticket, runBeforeArm(ticket.customerMessage(), context)));
+            after.add(arm(ticket, resolver.resolve(ticket.customerMessage(), context),
+                    EvalScorer.CitationRegime.ENFORCED));
+            // ABSENT, and this is the single most consequential line in the comparison. The old
+            // schema had no citations field, so every before-arm answer has an empty cited list for a
+            // reason that has nothing to do with its judgment. Scoring it ENFORCED would mark every
+            // one of them — including the ones that state the corpus's value and dodge the trap — as
+            // a hallucination, and the after arm would win against a baseline penalised for lacking
+            // a feature it never had. A flattering number is not a result.
+            before.add(arm(ticket, runBeforeArm(ticket.customerMessage(), context),
+                    EvalScorer.CitationRegime.ABSENT));
         }
 
         String report = render(before, after);
@@ -181,11 +189,12 @@ class GroundingBeforeAfterRunner extends org.aura.aura.PostgresBackedContext {
 
     // ---- scoring + report -----------------------------------------------------------------------
 
-    private Arm arm(EvalTicket ticket, Resolution resolution) {
+    private Arm arm(EvalTicket ticket, Resolution resolution, EvalScorer.CitationRegime regime) {
         // The classifier is not called: it is untouched by Day 16 and both arms would get the same
         // label, so paying Haiku twice per ticket would buy a column of identical values. A neutral
         // stand-in keeps the scorer's signature honest; only the grounding dimension is read below.
-        return new Arm(ticket, resolution, scorer.score(ticket, NEUTRAL_CLASSIFICATION, resolution));
+        return new Arm(ticket, resolution,
+                scorer.score(ticket, NEUTRAL_CLASSIFICATION, resolution, regime));
     }
 
     private static final org.aura.aura.classification.ClassificationResult NEUTRAL_CLASSIFICATION =
