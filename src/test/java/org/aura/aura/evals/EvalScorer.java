@@ -87,14 +87,31 @@ public final class EvalScorer {
      * <p>What is NOT quarantined: classifier category/urgency/intent, escalate, mustContain and
      * mustNotContain all still grade normally. The injection slice in particular is untouched, so the
      * canary-token leak check keeps working.
+     *
+     * <h2>Day 16 came and did NOT lift it, which is worth saying out loud</h2>
+     * The note below used to end "(Day 16)", and a deadline that passes silently is how a quarantine
+     * becomes permanent. Day 16 did not lift it because lifting it still needs the thing it always
+     * needed and grounding work never required: a live run against the real corpus to see which
+     * breadcrumbs retrieval actually returns for each of the 24 legacy tickets, plus a labelling-policy
+     * call on whether "the expected chunk is somewhere in the provided set" or "it ranks first" is the
+     * rule. Neither is a side effect of adding grounding gates, and doing it inside this change would
+     * have produced labels written against this change's own output.
+     *
+     * <p>What Day 16 did instead is add a SEPARATE dimension in a clean vocabulary — {@code
+     * expectedCitations}, in breadcrumbs, on the twelve new grounding tickets — so citation quality is
+     * measured today on the tickets that carry an honest label, without pretending the legacy 24 have
+     * one. The relabel is now a self-contained job with no dependency on grounding.
      */
     static final String SOURCES_QUARANTINE_REASON =
-            "QUARANTINED (Day 14): golden-set expectedSources still name retired hardcoded-KB ids "
-                    + "(kb-returns, kb-shipping, ...). Retrieval now cites chunk breadcrumbs, so every "
-                    + "labelled ticket would fail for a reason unrelated to behaviour. Re-enable by "
-                    + "relabelling expectedSources as breadcrumbs (Day 16) and restoring the "
-                    + "gradeSources call in EvalScorer.score — the grading rules themselves are intact "
-                    + "and still unit-tested.";
+            "QUARANTINED (Day 14, still quarantined after Day 16): golden-set expectedSources still "
+                    + "name retired hardcoded-KB ids (kb-returns, kb-shipping, ...). Retrieval now "
+                    + "cites chunk breadcrumbs, so every labelled ticket would fail for a reason "
+                    + "unrelated to behaviour. Day 16 added a separate breadcrumb-vocabulary dimension "
+                    + "(expectedCitations) for its own twelve tickets rather than relabelling these, "
+                    + "because relabelling needs a live run against the real corpus plus a policy call "
+                    + "on subset-vs-rank — neither of which grounding work produced. Re-enable by doing "
+                    + "that relabel and restoring the gradeSources call in EvalScorer.score; the "
+                    + "grading rules themselves are intact and still unit-tested.";
 
     public TicketScore score(EvalTicket ticket, ClassificationResult classification, Resolution resolution) {
         ExpectedResult expected = ticket.expected();
