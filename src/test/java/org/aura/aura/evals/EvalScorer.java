@@ -8,6 +8,7 @@ import org.aura.aura.retrieval.SourceRef;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 
 /**
  * Grades one ticket's live output against its label. A PURE function: no Spring, no I/O, no clock —
@@ -46,8 +47,22 @@ public final class EvalScorer {
      * and is what a labeller can actually write down, so it is the identifier the dimension will use
      * once it is re-enabled.
      */
-    public static List<String> citedBreadcrumbs(Resolution resolution) {
+    public static List<String> providedBreadcrumbs(Resolution resolution) {
         return resolution.sourcesProvided().stream().map(SourceRef::breadcrumb).toList();
+    }
+
+    /**
+     * What the answer CITED, in breadcrumbs — the Day 16 half.
+     *
+     * <p>This method had this name before Day 16 and returned {@code sourcesProvided}, because that
+     * was the only list there was. Keeping the name while its meaning changed would have been the
+     * exact defect the Day 14 {@code sourcesUsed -> sourcesProvided} rename was undoing, so the old
+     * behaviour moved to {@link #providedBreadcrumbs} and this name now means what it says. The
+     * quarantined sources dimension still grades the PROVIDED list, since that is what its retired
+     * labels were written against.
+     */
+    public static List<String> citedBreadcrumbs(Resolution resolution) {
+        return resolution.sourcesCited().stream().map(SourceRef::breadcrumb).toList();
     }
 
     /**
@@ -121,6 +136,10 @@ public final class EvalScorer {
             mustNotViolations = forbiddenPresent(expected.mustNotContain(), reply);
         }
 
+        TicketScore.GroundingResult grounding = resolverDegraded
+                ? TicketScore.GroundingResult.notApplicable()
+                : gradeGrounding(ticket, resolution);
+
         boolean classifierOk = classifierDegraded
                 || (Boolean.TRUE.equals(categoryMatch)
                     && Boolean.TRUE.equals(urgencyMatch)
@@ -129,7 +148,8 @@ public final class EvalScorer {
                 || (Boolean.TRUE.equals(escalateMatch)
                     && !sources.isFailure()
                     && mustContainMisses.isEmpty()
-                    && mustNotViolations.isEmpty());
+                    && mustNotViolations.isEmpty()
+                    && !grounding.isFailure());
         boolean passed = classifierOk && resolverOk;
 
         return new TicketScore(
@@ -137,7 +157,109 @@ public final class EvalScorer {
                 classifierDegraded, resolverDegraded,
                 categoryMatch, urgencyMatch, intentMatch,
                 true, escalateMatch, sources, mustContainMisses, mustNotViolations,
+                grounding,
                 passed);
+    }
+
+    /**
+     * THE DAY 16 DIMENSION. Rule-based only — no model judges another model here.
+     *
+     * <p>Every input is either a boolean the pipeline computed or a substring rule a human wrote, and
+     * that is a deliberate limit rather than a stage on the way to an LLM judge. The three metrics
+     * built on this are meant to be compared across runs, weeks apart; a judge whose own weights move
+     * would make a score movement unattributable, which is the exact property the prompt version
+     * marker and the frozen labelling policy exist to protect everywhere else in this harness.
+     *
+     * <h2>The refusal test reads STATUS, not prose</h2>
+     * "Did it refuse?" is {@code status == ESCALATED_TO_HUMAN} on a healthy call, which after Day 16
+     * can only have been produced by G3 or G4. It is deliberately not a string match on the reply
+     * ("I don't have that…"), because a model that hedges its way to a non-answer while sounding
+     * confident would score as an answer, and that is the failure most worth catching.
+     */
+    private TicketScore.GroundingResult gradeGrounding(EvalTicket ticket, Resolution resolution) {
+        Optional<GroundingClass> maybeClass = GroundingClass.of(ticket.slice());
+        if (maybeClass.isEmpty()) return TicketScore.GroundingResult.notApplicable();
+        GroundingClass groundingClass = maybeClass.get();
+
+        boolean expectedAnswer = groundingClass.expectsAnAnswer();
+        boolean refused = resolution.status() == ResolutionStatus.ESCALATED_TO_HUMAN;
+
+        if (refused) {
+            return new TicketScore.GroundingResult(groundingClass,
+                    expectedAnswer
+                            ? TicketScore.GroundingResult.Outcome.OVER_REFUSED
+                            : TicketScore.GroundingResult.Outcome.CORRECTLY_REFUSED,
+                    expectedAnswer,
+                    expectedAnswer
+                            ? "refused a ticket kb/ can answer (" + resolution.escalationCause() + ")"
+                            : "refused, as the corpus is silent (" + resolution.escalationCause() + ")");
+        }
+
+        // It ANSWERED. On an unanswerable ticket that is a hallucination by construction: there was
+        // nothing in the corpus to ground it in, so whatever it said came from training data. No
+        // string rule is needed and none is used — the class already establishes it.
+        if (!expectedAnswer) {
+            return new TicketScore.GroundingResult(groundingClass,
+                    TicketScore.GroundingResult.Outcome.HALLUCINATED, false,
+                    "answered a ticket the corpus cannot answer");
+        }
+
+        // A prior value present in a trap's reply. This is the OTHER hallucination shape and the one
+        // the traps exist for: fluent, plausible, well-formed, and sourced from training data instead
+        // of from the excerpt sitting in the prompt.
+        List<TicketScore.RuleViolation> priorLeaks = forbiddenPresent(ticket.expected().mustNotContain(),
+                resolution.answer());
+        if (!priorLeaks.isEmpty()) {
+            return new TicketScore.GroundingResult(groundingClass,
+                    TicketScore.GroundingResult.Outcome.HALLUCINATED, true,
+                    "answered with a generic-prior value: " + priorLeaks.stream()
+                            .map(TicketScore.RuleViolation::fragment).toList());
+        }
+
+        List<TicketScore.RuleViolation> factMisses = missingRequired(ticket.expected().mustContain(),
+                resolution.answer());
+        if (!factMisses.isEmpty()) {
+            return new TicketScore.GroundingResult(groundingClass,
+                    TicketScore.GroundingResult.Outcome.ANSWERED_WITHOUT_THE_FACT, true,
+                    "the labelled corpus fact is absent: " + factMisses.stream()
+                            .map(TicketScore.RuleViolation::fragment).toList());
+        }
+
+        // CITATION CHECKS. The subset half is a TRIPWIRE, not a measurement: G4 already guarantees it
+        // in production code, so it can only fire if a future refactor breaks the gate. That is
+        // exactly why it is worth an assertion here — a gate nothing observes is a gate that can be
+        // removed by accident, and the eval is the only place that watches the pipeline from outside.
+        List<String> cited = citedBreadcrumbs(resolution);
+        List<String> provided = resolution.sourcesProvided().stream().map(SourceRef::breadcrumb).toList();
+        if (cited.isEmpty()) {
+            return new TicketScore.GroundingResult(groundingClass,
+                    TicketScore.GroundingResult.Outcome.HALLUCINATED, true,
+                    "answered with the right fact but cited NOTHING — G4 should have made this "
+                            + "unreachable, so treat it as a broken gate rather than a model problem");
+        }
+        List<String> foreign = cited.stream().filter(c -> !provided.contains(c)).toList();
+        if (!foreign.isEmpty()) {
+            return new TicketScore.GroundingResult(groundingClass,
+                    TicketScore.GroundingResult.Outcome.HALLUCINATED, true,
+                    "cited breadcrumbs that were not retrieved: " + foreign + " — again a G4 tripwire");
+        }
+
+        // The named-chunk check, on the classes that can honestly name one (traps).
+        List<String> wanted = ticket.expected().expectedCitations();
+        if (wanted != null) {
+            List<String> missing = wanted.stream().filter(w -> !cited.contains(w)).toList();
+            if (!missing.isEmpty()) {
+                // Right answer, wrong receipt. Not a hallucination — the fact IS the corpus's — but it
+                // means the citation does not point at where the fact lives, so a human following the
+                // link lands somewhere that does not support the sentence.
+                return new TicketScore.GroundingResult(groundingClass,
+                        TicketScore.GroundingResult.Outcome.ANSWERED_WITHOUT_THE_FACT, true,
+                        "stated the corpus value but did not cite " + missing + " (cited " + cited + ")");
+            }
+        }
+
+        return new TicketScore.GroundingResult(groundingClass,
+                TicketScore.GroundingResult.Outcome.GROUNDED, true, "");
     }
 
     /**

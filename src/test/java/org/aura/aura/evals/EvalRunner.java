@@ -215,7 +215,61 @@ class EvalRunner extends org.aura.aura.PostgresBackedContext {
                 category, urgency, intent, escalate, sources,
                 new Accuracy((int) escalateFloorHits, scorable.size()),
                 replyRuleTickets, mustContainFail, mustNotFail,
+                grounding(graded),
                 perCategory, perSlice);
+    }
+
+    /**
+     * THE DAY 16 HEADLINE NUMBERS. Three rates, and the point of reporting all three is that no one of
+     * them can be read alone.
+     *
+     * <p>Hallucination rate falls to zero if the system refuses everything. Refusal correctness hits
+     * 100% the same way. Over-refusal is the number that makes those two honest — it is the price of
+     * the refusals that bought them, and a change to the grounding contract that improves the first
+     * two while quietly moving the third is a change that made the product worse.
+     *
+     * <p>Each rate has its OWN denominator, and they are deliberately not the same set:
+     *
+     * <ul>
+     *   <li><b>hallucination</b> — over every graded grounding ticket, because an answer sourced from
+     *       training data is equally wrong whichever class it happened on.</li>
+     *   <li><b>refusal correctness</b> — over UNANSWERABLE only: of the tickets that SHOULD be
+     *       refused, how many were. Nothing else can contribute.</li>
+     *   <li><b>over-refusal</b> — over ANSWERABLE + TRAP: of the tickets that should NOT be refused,
+     *       how many were anyway.</li>
+     * </ul>
+     *
+     * <p>Sharing one denominator across all three would make each rate move when an unrelated class
+     * grew, which is how a metric stops meaning anything without ever looking wrong.
+     */
+    private Grounding grounding(List<Graded> graded) {
+        List<Graded> rows = graded.stream().filter(g -> g.score().grounding().isGraded()).toList();
+
+        List<Graded> shouldRefuse = rows.stream()
+                .filter(g -> !g.score().grounding().expectedAnswer()).toList();
+        List<Graded> shouldAnswer = rows.stream()
+                .filter(g -> g.score().grounding().expectedAnswer()).toList();
+
+        Accuracy hallucination = new Accuracy((int) rows.stream()
+                .filter(g -> g.score().grounding().outcome()
+                        == TicketScore.GroundingResult.Outcome.HALLUCINATED).count(), rows.size());
+        Accuracy refusalCorrectness = new Accuracy((int) shouldRefuse.stream()
+                .filter(g -> g.score().grounding().outcome()
+                        == TicketScore.GroundingResult.Outcome.CORRECTLY_REFUSED).count(), shouldRefuse.size());
+        Accuracy overRefusal = new Accuracy((int) shouldAnswer.stream()
+                .filter(g -> g.score().grounding().outcome()
+                        == TicketScore.GroundingResult.Outcome.OVER_REFUSED).count(), shouldAnswer.size());
+
+        Map<String, Accuracy> perClass = new LinkedHashMap<>();
+        for (GroundingClass groundingClass : GroundingClass.values()) {
+            List<Graded> inClass = rows.stream()
+                    .filter(g -> g.score().grounding().groundingClass() == groundingClass).toList();
+            perClass.put(groundingClass.name(), new Accuracy(
+                    (int) inClass.stream().filter(g -> !g.score().grounding().isFailure()).count(),
+                    inClass.size()));
+        }
+
+        return new Grounding(rows.size(), hallucination, refusalCorrectness, overRefusal, perClass);
     }
 
     private Accuracy accuracy(List<Graded> graded, Predicate<Graded> applicable, Predicate<Graded> hit) {
@@ -270,6 +324,27 @@ class EvalRunner extends org.aura.aura.PostgresBackedContext {
         b.append(String.format("             %s%n", EvalScorer.SOURCES_QUARANTINE_REASON));
         b.append(String.format("  reply    : %d rule-carrying ticket(s); %d with a mustContain miss, %d with a mustNot violation%n",
                 agg.replyRuleTickets(), agg.replyMustContainFail(), agg.replyMustNotFail()));
+        b.append("\n");
+
+        b.append("GROUNDING (Day 16) — rule-based, over the answerable / unanswerable / trap slices\n");
+        Grounding grounding = agg.grounding();
+        if (grounding.graded() == 0) {
+            b.append("  (no grounding-class tickets scored)\n\n");
+        } else {
+            b.append(String.format("  graded              : %d ticket(s)%n", grounding.graded()));
+            b.append(String.format("  hallucination rate  : %s   (answered from training data, over ALL graded)%n",
+                    grounding.hallucination()));
+            b.append(String.format("  refusal correctness : %s   (refused, over tickets that SHOULD be refused)%n",
+                    grounding.refusalCorrectness()));
+            b.append(String.format("  over-refusal rate   : %s   (refused, over tickets that should NOT be)%n",
+                    grounding.overRefusal()));
+            // Printed together and never one at a time: refusing everything scores 0% hallucination
+            // and 100% refusal correctness, and only the third number shows what that cost.
+            b.append("  READ ALL THREE. A system that refuses everything scores perfectly on the first\n");
+            b.append("  two; over-refusal is the price that bought them.\n");
+            b.append("  per class (non-failing / graded):\n");
+            grounding.perClass().forEach((name, acc) -> b.append(String.format("    %-14s %s%n", name, acc)));
+        }
         b.append("\n");
 
         b.append("PER-CATEGORY pass rate (by label category)\n");
@@ -336,7 +411,7 @@ class EvalRunner extends org.aura.aura.PostgresBackedContext {
             }
             if (s.sourcesResult().isFailure()) {
                 b.append(String.format("      sources:  missing=%s extra=%s (actual=%s)%n",
-                        s.sourcesResult().missing(), s.sourcesResult().extra(), EvalScorer.citedBreadcrumbs(g.resolution())));
+                        s.sourcesResult().missing(), s.sourcesResult().extra(), EvalScorer.providedBreadcrumbs(g.resolution())));
             }
             for (TicketScore.RuleViolation miss : s.mustContainMisses()) {
                 b.append(String.format("      mustContain MISS: \"%s\" not in reply%n", miss.fragment()));
@@ -344,6 +419,10 @@ class EvalRunner extends org.aura.aura.PostgresBackedContext {
             for (TicketScore.RuleViolation v : s.mustNotViolations()) {
                 b.append(String.format("      mustNot VIOLATION: \"%s\" — context: %s%n",
                         v.fragment(), v.context()));
+            }
+            if (s.grounding().isFailure()) {
+                b.append(String.format("      grounding: %s [%s] — %s%n",
+                        s.grounding().outcome(), s.grounding().groundingClass(), s.grounding().reason()));
             }
         }
         return b.toString();
@@ -398,6 +477,20 @@ class EvalRunner extends org.aura.aura.PostgresBackedContext {
         resolverStage.put("replyMustContainFail", agg.replyMustContainFail());
         resolverStage.put("replyMustNotFail", agg.replyMustNotFail());
         root.put("resolverStage", resolverStage);
+
+        Map<String, Object> groundingStage = new LinkedHashMap<>();
+        groundingStage.put("gradedTickets", agg.grounding().graded());
+        groundingStage.put("hallucinationRate", agg.grounding().hallucination().toRatio());
+        groundingStage.put("refusalCorrectness", agg.grounding().refusalCorrectness().toRatio());
+        groundingStage.put("overRefusalRate", agg.grounding().overRefusal().toRatio());
+        // Committed WITH the numbers, for the same reason sourcesQuarantineReason is: a rate has no
+        // meaning without its denominator, and six months from now nobody should have to open this
+        // repository's history to learn that these three are measured over three different sets.
+        groundingStage.put("denominators",
+                "hallucinationRate over ALL graded grounding tickets; refusalCorrectness over "
+                        + "UNANSWERABLE only; overRefusalRate over ANSWERABLE + TRAP");
+        groundingStage.put("perClassNonFailing", ratios(agg.grounding().perClass()));
+        root.put("groundingStage", groundingStage);
         root.put("perCategoryPassRate", ratios(agg.perCategory()));
         root.put("perSlicePassRate", ratios(agg.perSlice()));
         root.put("overallPassRate", new Accuracy(agg.passed(), agg.scored()).toRatio());
@@ -444,7 +537,14 @@ class EvalRunner extends org.aura.aura.PostgresBackedContext {
         row.put("actualUrgency", g.classification().classification().urgency().name());
         row.put("actualIntent", g.classification().classification().intent().name());
         row.put("actualEscalate", g.resolution().escalate());
-        row.put("actualSources", EvalScorer.citedBreadcrumbs(g.resolution()));
+        row.put("actualStatus", g.resolution().status().name());
+        row.put("actualEscalationCause", g.resolution().escalationCause().name());
+        row.put("actualSources", EvalScorer.providedBreadcrumbs(g.resolution()));
+        row.put("actualCitations", EvalScorer.citedBreadcrumbs(g.resolution()));
+        row.put("groundingClass", s.grounding().groundingClass() == null
+                ? null : s.grounding().groundingClass().name());
+        row.put("groundingOutcome", s.grounding().outcome().name());
+        row.put("groundingReason", s.grounding().reason());
         return row;
     }
 
@@ -514,5 +614,10 @@ class EvalRunner extends org.aura.aura.PostgresBackedContext {
             Accuracy category, Accuracy urgency, Accuracy intent, Accuracy escalate, Accuracy sources,
             Accuracy escalateFloor,
             int replyRuleTickets, int replyMustContainFail, int replyMustNotFail,
+            Grounding grounding,
             Map<String, Accuracy> perCategory, Map<String, Accuracy> perSlice) {}
+
+    /** @param graded how many tickets carry a grounding class at all — 0 on a pre-v3 golden set */
+    private record Grounding(int graded, Accuracy hallucination, Accuracy refusalCorrectness,
+                             Accuracy overRefusal, Map<String, Accuracy> perClass) {}
 }

@@ -31,6 +31,16 @@ package org.aura.aura.evals;
  */
 public record LabelingPolicy(
         int version,
+        /**
+         * v3: the law for the three grounding classes.
+         *
+         * <p>It exists because those labels are unlike every other field here. {@code category} and
+         * {@code urgency} are claims about the TICKET, and a ticket does not change. A grounding
+         * class is a claim about the CORPUS — "kb/ is silent on this" — so it can be falsified by an
+         * edit to a file in a different directory, with nothing in this one changing. Writing the
+         * rule down is what makes that failure mode reviewable instead of a mystery score movement.
+         */
+        String groundingClassRule,
         String intentUnderInjection,
         String categoryTieBreak,
         String urgencyRubric,

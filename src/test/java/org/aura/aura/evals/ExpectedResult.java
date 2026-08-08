@@ -32,6 +32,28 @@ public record ExpectedResult(
         TicketIntent intent,
         boolean escalate,
         List<String> expectedSources,
+        /**
+         * Day 16: breadcrumbs the answer MUST have cited, or null for "do not grade which chunk".
+         *
+         * <h2>Why this is not just a relabelled {@code expectedSources}</h2>
+         * They are in different vocabularies and grade different things, and merging them would put
+         * two meanings in one slot. {@code expectedSources} above is the Day 13 dimension, still
+         * quarantined, whose entries are retired hardcoded-KB ids ({@code kb-returns}); it graded
+         * what retrieval SUPPLIED. This grades what the answer CITED, in breadcrumbs, which only
+         * became a checkable fact when G4 started verifying citations. Reusing the old field would
+         * have left a golden set where an entry's meaning depended on which ticket it was attached
+         * to — and the quarantine note already warns that relabelling that field needs a live run
+         * against the real corpus, which grounding work never required.
+         *
+         * <h2>Populated only where the chunk is unambiguous</h2>
+         * Null on {@code answerable} tickets and non-null on {@code trap} ones, following what each
+         * class can honestly assert. A trap has exactly one chunk that contains the counter-prior
+         * value, so naming it is a fact. Several answerable facts appear in two chunks (35 USD is in
+         * both the delivery table and the free-shipping section), so pinning one would fail a correct
+         * answer that cited the other — a label testing retrieval's tie-break while claiming to test
+         * grounding.
+         */
+        List<String> expectedCitations,
         List<String> mustContain,
         List<String> mustNotContain
 ) {}
