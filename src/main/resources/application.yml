@@ -95,7 +95,7 @@ spring:
         # repeating verbatim on a different driver.
         #
         # 2s against a retrieval query whose measured p50 is single-digit milliseconds on a
-        # 33-chunk corpus — roughly two orders of magnitude of headroom, so this fires on a stall,
+        # 34-chunk corpus — roughly two orders of magnitude of headroom, so this fires on a stall,
         # never on a slow-but-working query.
         #
         # SCOPE WORTH NAMING: this applies to EVERY statement on this DataSource, including the
@@ -187,7 +187,7 @@ aura:
   # --- Day 14 (Decisions 2 + 3): retrieval policy ------------------------------------------------
   retrieval:
     # CORPUS-RELATIVE, and that is a property of this number, not a caveat about it. 8 ≈ a quarter of
-    # today's 33-chunk corpus — asking for a quarter of everything is a reasonable candidate pool at
+    # today's 34-chunk corpus — asking for a quarter of everything is a reasonable candidate pool at
     # this size and would be an absurd one at 10,000 chunks. Revisit at Day 15 ingestion, when the
     # corpus stops being three policy documents.
     #
@@ -199,6 +199,14 @@ aura:
     # Measured, 2026-08-04, against the real corpus:
     #   SELECT count(*), sum, min, avg, median, p90, max OF token_count FROM kb_chunks;
     #   -> n=33  total=4860  min=67  median=133  avg=147.27  p90=189  max=499
+    #
+    # RE-MEASURED 2026-08-08, after Day 16 added the gift-card section to refund-policy.md:
+    #   -> n=34  total=5122  min=67  median=134  avg=150.65  p90=194  max=499
+    # Recorded rather than quietly overwritten, because the point of the derivation below is that the
+    # number came from a corpus shape — so when the corpus changes, the honest thing is to show that
+    # the shape did NOT move enough to matter. avg 147.27 -> 150.65 shifts the admissible window from
+    # [589, 736] to [603, 753]; 700 is comfortably inside both. max is unchanged at 499, which is the
+    # constraint that actually pinned the value. No change is warranted and none is made.
     #
     # DERIVATION. The sizing rule was "admit ~4-5 average chunks", which fixes a window:
     #   4 x 147.27 = 589   (floor)      5 x 147.27 = 736   (ceiling)      700 = 4.75 x avg
@@ -216,17 +224,18 @@ aura:
     #   at 700:                     499 + 133 = 632 < 700  -> it still admits a second
     # That is the strongest single argument in this decision, and it points upward.
     #
-    # SHAPE. 31 of the 33 chunks sit between 67 and 194; the only outliers are one 323 and one 499. So
-    # the mean is dragged up by a two-chunk tail and the median is the better description of a typical
-    # chunk — sizing on the mean is conservative in the right direction here. That spread is also why
-    # the budget is expressed in TOKENS rather than as "top 4": how many chunks survive genuinely
-    # varies per ticket, and it should.
+    # SHAPE. 31 of the 34 chunks sit between 67 and 194; the only outliers are one 242, one 323 and
+    # one 499. So the mean is dragged up by a short tail and the median is the better description of a
+    # typical chunk — sizing on the mean is conservative in the right direction here. That spread is
+    # also why the budget is expressed in TOKENS rather than as "top 4": how many chunks survive
+    # genuinely varies per ticket, and it should.
     #
     # NOT MEASURED, and worth saying so. Between 589 and 736 nothing distinguishes 700 from 690 or
     # 720 — it is a round number inside an admissible window. More to the point, answer QUALITY has
     # never been measured against this budget: there is no recall@k sweep and no eval run at 500 vs
     # 700 vs 900. This number is derived from the corpus's shape and a rule of thumb, not from an
-    # outcome. Day 16's relevance work is where that measurement naturally comes from.
+    # outcome. Day 16's grounding evals are the first measurement that touches it — they score whether
+    # the answer was grounded and cited, which is downstream of whether the right chunk fitted.
     #
     # The unit is the stored token_count: the same ~4-chars-per-token English APPROXIMATION the
     # chunker uses, because there is no clean JVM build of Voyage's tokenizer. Packing is integer
