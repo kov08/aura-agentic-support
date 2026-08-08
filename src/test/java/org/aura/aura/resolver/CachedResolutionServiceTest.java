@@ -180,6 +180,66 @@ class CachedResolutionServiceTest {
         verify(cache).put(KEY, escalating);
     }
 
+    // ---------------------------------------------------------------- Day 16: grounding vs the cache
+
+    // POLICY: a GROUNDING refusal IS cached, and this is the one Day 16 behaviour change here.
+    //
+    // The old gate was "never store an ESCALATED_TO_HUMAN result", which was correct while the
+    // Resilience4j fallback was that status's only writer. "The knowledge base does not answer this
+    // question" is a different kind of fact: it is about the ticket and the corpus rather than about
+    // this minute, it will be just as true in an hour, and re-deriving it costs a full Sonnet call on
+    // exactly the tickets most likely to be asked again.
+    //
+    // It cannot fossilize, and not because anyone remembers to flush it: the key hashes the RETRIEVED
+    // BYTES (Decision 4), so publishing the missing policy document and re-ingesting changes what this
+    // ticket retrieves, changes its key, and orphans the cached refusal.
+    @Test
+    void aGroundingRefusalIsCachedBecauseItIsAKnowledgeAnswer() {
+        Resolution refused = Resolution.escalatedUngrounded(EscalationCause.UNGROUNDED);
+        stubKey();
+        when(retrieval.retrieve(TICKET)).thenReturn(CONTEXT);
+        when(cache.get(KEY)).thenReturn(Optional.empty());
+        when(resolver.resolve(TICKET, CONTEXT)).thenReturn(refused);
+
+        Resolution result = service.resolve(REQUEST);
+
+        assertThat(result).isSameAs(refused);
+        verify(cache).put(KEY, refused);
+    }
+
+    @Test
+    void aCitationViolationRefusalIsCachedForTheSameReason() {
+        Resolution refused = Resolution.escalatedUngrounded(EscalationCause.UNVERIFIABLE_CITATIONS);
+        stubKey();
+        when(retrieval.retrieve(TICKET)).thenReturn(CONTEXT);
+        when(cache.get(KEY)).thenReturn(Optional.empty());
+        when(resolver.resolve(TICKET, CONTEXT)).thenReturn(refused);
+
+        service.resolve(REQUEST);
+
+        verify(cache).put(KEY, refused);
+    }
+
+    // POLICY: an UNREADABLE-OUTPUT escalation is NOT cached, even though no dependency was down.
+    // "Was a dependency unhealthy" is the wrong question for the cache; "would repeating this request
+    // legitimately give a different answer" is the right one, and here it would — the model answered
+    // three times and produced garbage three times at temperature 1.0, which is a property of those
+    // draws and not of the ticket. Caching it would freeze one bad generation in front of a question
+    // the model will very likely answer correctly next time.
+    @Test
+    void anUnreadableOutputEscalationIsNotCachedEvenThoughNothingWasDown() {
+        Resolution unusable = Resolution.escalatedToHuman(EscalationCause.OUTPUT_UNUSABLE);
+        stubKey();
+        when(retrieval.retrieve(TICKET)).thenReturn(CONTEXT);
+        when(cache.get(KEY)).thenReturn(Optional.empty());
+        when(resolver.resolve(TICKET, CONTEXT)).thenReturn(unusable);
+
+        Resolution result = service.resolve(REQUEST);
+
+        assertThat(result).isSameAs(unusable);
+        verify(cache, never()).put(any(), any());
+    }
+
     // ---------------------------------------------------------------- Decision 5: retrieval degrades
 
     // POLICY: a retrieval dependency that is unwell degrades to a human, exactly as an unwell Claude

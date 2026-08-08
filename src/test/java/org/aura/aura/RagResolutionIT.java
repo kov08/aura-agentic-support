@@ -12,6 +12,7 @@ import com.anthropic.models.messages.TextBlockParam;
 import com.redis.testcontainers.RedisContainer;
 import org.aura.aura.client.VoyageEmbeddingClient;
 import org.aura.aura.resolver.CachedResolutionService;
+import org.aura.aura.resolver.EscalationCause;
 import org.aura.aura.resolver.Resolution;
 import org.aura.aura.resolver.ResolutionStatus;
 import org.aura.aura.resolver.ResolverOutput;
@@ -246,6 +247,50 @@ class RagResolutionIT extends PostgresBackedContext {
                 .isEqualTo("You're within the 45-day window.");
         verify(anthropic.messages(), times(2)).create(any(StructuredMessageCreateParams.class));
     }
+
+    // ---------------------------------------------------------------- Day 16: grounding + the cache
+
+    /**
+     * WORK ITEM 5 end to end: a grounding refusal is stored, and a repeat of the same ticket is
+     * served from Redis without paying Sonnet again.
+     *
+     * <p>Unit tests pin the policy against a mocked cache; this pins it against a real one, through
+     * the real key. The distinction it rests on is invisible to {@code status} — both this and an
+     * Anthropic outage are ESCALATED_TO_HUMAN — so if the cache gate ever slipped back to keying on
+     * status, every refusal would silently cost a full model call forever and nothing would fail.
+     */
+    @Test
+    void aGroundingRefusalIsServedFromCacheOnTheSecondIdenticalTicket() {
+        stubClaudeRaw("{\"reply\":\"\",\"citations\":[],\"escalate\":true,\"grounded\":false}");
+
+        Resolution first = resolutions.resolve(new ResolveTicketRequest(TICKET));
+        Resolution second = resolutions.resolve(new ResolveTicketRequest(TICKET));
+
+        assertThat(first.status()).isEqualTo(ResolutionStatus.ESCALATED_TO_HUMAN);
+        assertThat(second.status()).isEqualTo(ESCALATED);
+        assertThat(second.escalationCause()).isEqualTo(EscalationCause.UNGROUNDED);
+        assertThat(second.answer()).isEqualTo(first.answer());
+        // ONE model call for two tickets. "The knowledge base does not answer this" is a fact about
+        // the corpus, not about this minute, and the Decision 4 key is what makes storing it safe:
+        // re-ingesting a document that covers the question changes what this ticket retrieves, which
+        // changes the key, which orphans the entry.
+        verify(anthropic.messages(), times(1)).create(any(StructuredMessageCreateParams.class));
+    }
+
+    /** An availability escalation is the opposite policy, and it must stay that way. */
+    @Test
+    void anUnreadableOutputEscalationIsNotServedFromCache() {
+        stubClaudeRaw("{\"reply\": \"truncated mid-");
+
+        resolutions.resolve(new ResolveTicketRequest(TICKET));
+        resolutions.resolve(new ResolveTicketRequest(TICKET));
+
+        // Three attempts per request (the gate-0 retry budget), twice: nothing was stored, so the
+        // second ticket re-ran the whole thing rather than inheriting one bad generation for a day.
+        verify(anthropic.messages(), times(6)).create(any(StructuredMessageCreateParams.class));
+    }
+
+    private static final ResolutionStatus ESCALATED = ResolutionStatus.ESCALATED_TO_HUMAN;
 
     // ---------------------------------------------------------------- fixtures
 

@@ -1,7 +1,9 @@
 package org.aura.aura;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.redis.testcontainers.RedisContainer;
 import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry;
+import okhttp3.mockwebserver.MockResponse;
 import okhttp3.mockwebserver.MockWebServer;
 import okhttp3.mockwebserver.QueueDispatcher;
 import org.junit.jupiter.api.AfterAll;
@@ -285,5 +287,80 @@ class AnthropicTransportIT extends PostgresBackedContext {
         // machine-caught.
         assertThat(resp.getStatusCode().value()).isEqualTo(200);
         assertThat(field(resp, "outcome")).isEqualTo("ESCALATED_TO_HUMAN");
+    }
+
+    // ---------------------------------------------------------------- Day 16: grounding at the edge
+    //
+    // The gates are unit-tested against a mocked client. These two prove the same decisions survive
+    // the whole stack — the real SDK's serialization, the real controller, the real DTO mapping — and
+    // in particular that a grounding refusal reaches the customer the way ADR-013 says it must:
+    // HTTP 200 carrying a business verdict, never a 4xx/5xx that a client would treat as an error.
+
+    /**
+     * IT-6: the model reports that the excerpts do not answer the ticket. That is the contract
+     * working, and it must not look like a failure to anyone downstream.
+     */
+    @Test
+    void it6_insufficientContext_escalates_http200_withNoSources() {
+        ANTHROPIC.enqueue(classifierOk());
+        ANTHROPIC.enqueue(resolverInsufficient());
+        int before = ANTHROPIC.getRequestCount();
+
+        ResponseEntity<String> resp = resolve(rest, "it6", "Do you offer a student discount?");
+
+        assertThat(resp.getStatusCode().value()).isEqualTo(200);
+        assertThat(field(resp, "outcome")).isEqualTo("ESCALATED_TO_HUMAN");
+        // NOT retried. A refusal is a completed, correct answer — retrying it would spend a second
+        // Sonnet call to ask the same question of the same documents and get the same reply.
+        assertThat(ANTHROPIC.getRequestCount() - before).isEqualTo(2);
+        // Neither list survives an escalation, and the ledger being empty here is the interesting
+        // half: retrieval SUCCEEDED, an excerpt was seeded and shown, and the response still carries
+        // no receipt — because this reply was produced instead of an answer, not from that document.
+        assertThat(array(resp, "sourcesCited")).isEmpty();
+        assertThat(array(resp, "sourcesProvided")).isEmpty();
+    }
+
+    /**
+     * IT-7: a grounded answer citing an id retrieval really supplied — the only path on which a
+     * customer reads model-written text, end to end.
+     */
+    @Test
+    void it7_groundedAnswer_carriesTheCitedSourceOnTheWire() {
+        ANTHROPIC.enqueue(classifierOk());
+        ANTHROPIC.enqueue(resolverOk(KbFixtures.GROUNDING_CHUNK_ID.toString()));
+
+        ResponseEntity<String> resp = resolve(rest, "it7", "How long do I have to request a refund?");
+
+        assertThat(resp.getStatusCode().value()).isEqualTo(200);
+        assertThat(field(resp, "outcome")).isEqualTo("RESOLVED");
+        assertThat(field(resp, "resolutionText")).isEqualTo(RESOLVER_REPLY);
+
+        // The citation arrives as a real object with the Day 12 breadcrumb, resolved from the ledger
+        // rather than echoed back as the bare string the model sent.
+        JsonNode cited = array(resp, "sourcesCited");
+        assertThat(cited).hasSize(1);
+        assertThat(cited.get(0).path("chunkId").asText())
+                .isEqualTo(KbFixtures.GROUNDING_CHUNK_ID.toString());
+        assertThat(cited.get(0).path("breadcrumb").asText())
+                .isEqualTo("Refund Policy > Standard Refund Window");
+        // And the ledger still says what was SHOWN, independently. The two are separate fields
+        // because they answer separate questions; here they happen to agree because one excerpt was
+        // seeded and it was the one cited.
+        assertThat(array(resp, "sourcesProvided")).hasSize(1);
+    }
+
+    /** A scripted "the excerpts do not answer this" envelope: grounded=false, nothing cited. */
+    private static MockResponse resolverInsufficient() {
+        return AnthropicMessages.ok200("claude-sonnet-4-5",
+                "{\"reply\":\"\",\"citations\":[],\"escalate\":true,\"grounded\":false}");
+    }
+
+    /** Reads a top-level ARRAY field out of the response body (AnthropicMessages.field is strings). */
+    private static JsonNode array(ResponseEntity<String> resp, String name) {
+        try {
+            return AnthropicMessages.MAPPER.readTree(resp.getBody()).path(name);
+        } catch (Exception e) {
+            throw new RuntimeException("response body was not JSON: " + resp.getBody(), e);
+        }
     }
 }
