@@ -9,8 +9,10 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.client.RestClient;
 
 import java.time.Duration;
+import java.util.Arrays;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
 
 /**
  * Shared, STATELESS fixtures for the Day 11 transport integration tests (AnthropicTransportIT,
@@ -67,10 +69,25 @@ final class AnthropicMessages {
                 "{\"category\":\"ORDER_STATUS\",\"urgency\":\"HIGH\",\"intent\":\"GET_INFORMATION\",\"confidence\":0.95}");
     }
 
-    // Resolver (Sonnet) success: a ResolverOutput carrying a customer reply and escalate=false.
-    static MockResponse resolverOk() {
+    /**
+     * Resolver (Sonnet) success: a {@code ResolverOutput} carrying a customer reply, escalate=false,
+     * and — since Day 16 — a grounding verdict plus the ids it claims to have used.
+     *
+     * <p>The ids are a PARAMETER rather than a constant because the G4 gate checks them against the
+     * chunks retrieval actually supplied for that request, which every calling test controls
+     * separately. A hardcoded id here would be a foreign citation in every scenario, and the whole
+     * transport suite would escalate for a reason that has nothing to do with transport.
+     *
+     * <p>All four fields are always present: {@code grounded} is a primitive boolean, so an envelope
+     * that omits it is a hard parse failure rather than a silent false.
+     */
+    static MockResponse resolverOk(String... citedChunkIds) {
+        String citations = Arrays.stream(citedChunkIds)
+                .map(id -> "\"" + id + "\"")
+                .collect(Collectors.joining(",", "[", "]"));
         return ok200("claude-sonnet-4-5",
-                "{\"reply\":\"" + RESOLVER_REPLY + "\",\"escalate\":false}");
+                "{\"reply\":\"" + RESOLVER_REPLY + "\",\"citations\":" + citations
+                        + ",\"escalate\":false,\"grounded\":true}");
     }
 
     // A resolver success whose BODY is delayed — the "hang" simulation. The delay lives in the script;

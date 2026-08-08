@@ -169,7 +169,15 @@ class RagResolutionIT extends PostgresBackedContext {
         assertThat(system).hasSize(1);
         assertThat(system.getFirst().cacheControl()).isPresent();
         assertThat(system.getFirst().text()).contains("Answer only from the provided documents");
-        assertThat(system.getFirst().text()).doesNotContain("<documents>");
+        // The assertion is "no RETRIEVED byte reached the prefix", and as of Day 16 it has to be
+        // written that way rather than as doesNotContain("<documents>"): the prompt's few-shot
+        // examples now show a real <documents> block, because a few-shot that teaches citations has
+        // to show the ids being cited. Testing for the literal tag would now fail on the prompt's own
+        // (invented, ExampleCo) content while a genuine leak of THIS request's corpus went unnoticed —
+        // which is the assertion inverted. The chunk text is what must never be in the cached prefix.
+        assertThat(system.getFirst().text())
+                .doesNotContain("Customers have 30 days from the delivery date")
+                .doesNotContain("Standard delivery is 3-5 business days");
 
         // AFTER the breakpoint: the documents, then the ticket.
         String userTurn = sent.messages().getFirst().content().asString();
