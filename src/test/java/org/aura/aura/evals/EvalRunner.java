@@ -57,7 +57,7 @@ import static org.assertj.core.api.Assertions.assertThat;
         // run, on top of the live Anthropic calls the harness already makes — a real cost increase,
         // and the alternative is worse: an empty kb_chunks would make every ticket ungrounded and the
         // whole run would score a system nobody ships.
-        properties = "aura.kb.load=true")
+        properties = "aura.ingest.enabled=true")
 class EvalRunner extends org.aura.aura.PostgresBackedContext {
 
     private final TicketClassificationService classifier;

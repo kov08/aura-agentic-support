@@ -3,9 +3,9 @@ package org.aura.aura.canary;
 import org.aura.aura.client.VoyageEmbeddingClient;
 import org.aura.aura.config.CanaryProperties;
 import org.aura.aura.config.VoyageProperties;
-import org.aura.aura.ingest.KbCorpusLoader;
-import org.aura.aura.store.ChunkRepository;
-import org.aura.aura.store.KbChunk;
+import org.aura.aura.ingest.IngestionPipeline;
+import org.aura.aura.store.CanaryProbe;
+import org.aura.aura.store.CanaryProbeRepository;
 import org.aura.aura.util.VectorLiterals;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
@@ -71,7 +71,7 @@ import static org.assertj.core.api.Assertions.assertThat;
                 "spring.autoconfigure.exclude=",
                 // Ingest the corpus during context startup — the harness needs a stored document-lane
                 // vector to measure against, and that is what ingestion produces.
-                "aura.kb.load=true"
+                "aura.ingest.enabled=true"
         })
 @Testcontainers
 class CanaryBandHarnessIT {
@@ -111,11 +111,10 @@ class CanaryBandHarnessIT {
     static final PostgreSQLContainer<?> POSTGRES = new PostgreSQLContainer<>(
             DockerImageName.parse("pgvector/pgvector:pg17").asCompatibleSubstituteFor("postgres"));
 
-    @Autowired KbCorpusLoader loader;
-    @Autowired ChunkRepository chunks;
+    @Autowired IngestionPipeline pipeline;
+    @Autowired CanaryProbeRepository probe;
     @Autowired VoyageEmbeddingClient voyage;
     @Autowired VoyageProperties voyageProps;
-    @Autowired CanaryProperties canaryProps;
     @Autowired JdbcTemplate jdbc;
 
     @Test
@@ -125,32 +124,36 @@ class CanaryBandHarnessIT {
                         + "profile falls back to the dummy 'test-key' when it is absent)")
                 .isNotEqualTo("test-key");
 
-        // The corpus was ingested during startup by the ApplicationRunner; this call is the skip guard
-        // proving it, exactly as in SemanticSearchDemoIT.
-        assertThat(loader.load().skipped()).isTrue();
+        // The corpus was ingested during startup by the ApplicationRunner; this run is the
+        // idempotency proof of it, exactly as in SemanticSearchDemoIT.
+        assertThat(pipeline.ingest().embeddingCalls()).isZero();
 
-        // ---- 1. The canary chunk, addressed the way the guard will address it -----------------
-        KbChunk canary = chunks
-                .findBySourceDocAndChunkIndex(canaryProps.sourceDoc(), canaryProps.chunkIndex())
-                .orElseThrow(() -> new AssertionError(
-                        "no chunk at " + canaryProps.sourceDoc() + "#" + canaryProps.chunkIndex()
-                                + " — aura.canary.source-doc/chunk-index must name a chunk the "
-                                + "chunker actually produces from kb/"));
+        // ---- 1. The probe row, addressed the way the guard will address it ---------------------
+        // V4: the stored side is canary_probe, a one-row table, not a chunk in the retrieval corpus.
+        // There is nothing to configure here any more — aura.canary.source-doc and chunk-index are
+        // gone, because the row is pinned by a primary key the schema's CHECK fixes at 1. That is the
+        // whole reason the harness can no longer measure against the wrong thing.
+        CanaryProbe canary = probe.findProbe().orElseThrow(() -> new AssertionError(
+                "canary_probe holds no row — the pipeline writes it in the same transaction as the "
+                        + "canary's ledger entry, so an empty probe after a successful ingest means "
+                        + "the canary document failed; check the IngestReport for '"
+                        + CanaryDocument.PATH + "'"));
 
-        assertThat(canary.getEmbeddingModel())
+        assertThat(canary.getEmbeddingModelId())
                 .as("the STORED side of the pairing must be the document lane's premium model — "
                         + "measuring against anything else calibrates a band for a pairing no "
                         + "customer request ever rides")
                 .isEqualTo(voyageProps.documentModel());
 
-        // embeddingInput(), never a hand-rolled breadcrumb + "\n" + content here: the query lane must
-        // embed the byte-identical string the document lane embedded at ingestion, or the measured
-        // distance includes a text difference that has nothing to do with the lanes.
-        String canaryText = canary.embeddingInput();
+        // The frozen constant, which is what the pipeline embedded and what the guard re-embeds. Never
+        // a hand-rolled breadcrumb + "\n" + text here: the query lane must embed the byte-identical
+        // string the document lane embedded at ingestion, or the measured distance includes a text
+        // difference that has nothing to do with the lanes.
+        String canaryText = CanaryDocument.fingerprintContent();
 
         System.out.printf("%n=== Day 14 canary band harness ===%n");
-        System.out.printf("stored : %s#%d  model=%s  lane=document%n",
-                canary.getSourceDoc(), canary.getChunkIndex(), canary.getEmbeddingModel());
+        System.out.printf("stored : canary_probe (%s)  model=%s  lane=document%n",
+                CanaryDocument.PATH, canary.getEmbeddingModelId());
         System.out.printf("fresh  : model=%s  lane=query  n=%d%n",
                 voyageProps.queryModel(), SAMPLES);
         System.out.printf("text   : %s%n%n", oneLine(canaryText));
@@ -160,10 +163,8 @@ class CanaryBandHarnessIT {
         for (int i = 0; i < SAMPLES; i++) {
             if (i > 0) Thread.sleep(PACING_MILLIS);
             float[] fresh = voyage.embedQuery(canaryText);
-            double distance = chunks
-                    .distanceFrom(canary.getSourceDoc(), canary.getChunkIndex(),
-                            VectorLiterals.toLiteral(fresh))
-                    .orElseThrow(() -> new AssertionError("the canary row vanished mid-run"));
+            double distance = probe.distanceFrom(VectorLiterals.toLiteral(fresh))
+                    .orElseThrow(() -> new AssertionError("the canary probe row vanished mid-run"));
             distances.add(distance);
             System.out.printf(Locale.ROOT, "  sample %2d  distance=%.8f%n", i + 1, distance);
         }

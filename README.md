@@ -890,7 +890,7 @@ docker compose up -d
 ```
 
 ```bash
-./mvnw spring-boot:run -Daura.kb.load=true
+./mvnw spring-boot:run -Daura.ingest.enabled=true
 ```
 
 ```bash
@@ -1058,9 +1058,169 @@ docker compose up -d
 ```
 
 ```bash
-./mvnw spring-boot:run -Daura.kb.load=true
+./mvnw spring-boot:run -Daura.ingest.enabled=true
 ```
 
 ```bash
 ./mvnw verify -Pdemo -Dit.test=CanaryBandHarnessIT
+```
+
+## Day 15 — Incremental ingestion: a document ledger, and a canary that cannot be retrieved
+
+Day 13's loader could ask the database exactly one question — *are there any rows?* — which has two
+answers and therefore two behaviours: skip everything, or wipe the table and re-embed everything.
+Wipe-and-reload is also an outage: between the DELETE and the last INSERT, every query runs against a
+partial knowledge base.
+
+Both problems share a root. The store held no record of **what** it held.
+
+### The whole design is one column
+
+`kb_documents.fingerprint` is a SHA-256 over normalised content **plus the configuration that turns it
+into vectors** — chunker version, embedding model id, dimension. That makes "has this already been
+ingested under the current regime?" a string comparison instead of a judgement, and it is the only
+value that survives between runs. Everything else — the scan, the chunks, the vectors, the plan — is
+recomputed from scratch every time.
+
+A content-only hash answers the wrong question. It reports *unchanged* for a byte-identical file whose
+embedding model was swapped, and the store then holds two eras at once with every similarity score
+collapsing toward random. Conspicuously **absent** from the hash: mtime, size, inode. All three change
+on a fresh clone that restores identical bytes, so a fingerprint built on any of them re-embeds the
+entire corpus, for money, on every checkout.
+
+```
+scan kb/ -> fingerprint -> read ledger -> diff (IngestionPlan) -> guard
+                                                                    |
+   per NEW/CHANGED:  chunk -> embedBatched -> [ swap in one transaction ]
+   per DELETED:                               [ remove in one transaction ]
+```
+
+### The root-level concept: the self-invocation trap
+
+The per-document swap must be atomic — delete old chunks, insert new ones, advance the fingerprint.
+The instinct is to annotate `processDocument` with `@Transactional` and call it from the loop. It
+compiles, it reads correctly, and **it does nothing at all**.
+
+`@Transactional` works by an AOP proxy that wraps the bean from *outside*, so it only intercepts calls
+crossing the bean boundary. `this.processDocument(path)` never leaves the object, never touches the
+proxy, and the annotation is inert: no error, no warning, no transaction, partial writes on the first
+failure. The trap is invisible precisely because the code says what you meant.
+
+The fix is `TransactionTemplate` — one programmatic transaction per document. For a loop of
+*independent* transactions, where the point is that B's failure must not roll back A, the explicit
+boundary is arguably clearer than the annotation would have been. The same trap appears one layer
+down: `embedBatched` calls the private core rather than `this.embedDocuments(...)`, or `@Retry` would
+be equally inert.
+
+Two ordering rules that are load-bearing rather than stylistic:
+
+- **The embedding call is outside the transaction.** Holding a Hikari connection across an HTTP
+  request — retries included — is the Day 14 pool review's FINDING 3 arriving for real. It also buys
+  failure isolation free: a document whose embedding throws never opens a transaction.
+- **The fingerprint advances last.** It is the only record that the work happened, so advancing it
+  before the chunks commit is how a half-written document gets permanently skipped by every later run.
+
+### Recovery is doing nothing
+
+The first live run hit a real **HTTP 429** on the fourth document — all three retries exhausted, on a
+key whose ceiling `CanaryBandHarnessIT` had already measured at ~3 requests/minute. Unplanned, and it
+exercised failure isolation against the actual provider:
+
+```
+run 1   4 new, 0 changed, 0 unchanged, 0 deleted, 1 failed;   3 calls   4282ms
+run 2   1 new, 0 changed, 3 unchanged, 0 deleted, 0 failed;   1 call     436ms
+run 3   0 new, 0 changed, 4 unchanged, 0 deleted, 0 failed;   0 calls    129ms
+```
+
+No retry queue, no dead-letter state. `warranty-policy.md` never got a ledger row, so it was simply
+`new` again on the next run. `embeddingCalls` is the idempotency proof made into an integer — run 3 is
+the claim of this entire day.
+
+### Breaking it on purpose: the empty mount
+
+Two variants, predictions written down first.
+
+| variant | prediction | observed |
+| --- | --- | --- |
+| Existing but empty directory | stops in `guard()`, `IngestionRefusedException`, store intact | correct |
+| Nonexistent path | `NoSuchFileException` caught, guard still runs, identical refusal | correct |
+| Framework wrapping | Boot wraps it in `IllegalStateException: Failed to execute ApplicationRunner` | **wrong** — Boot 4.1 rethrows unwrapped, so the top line of the failure *is* the diagnosis |
+
+The two variants differ by exactly one WARN line, which was the point: a typo'd host path and an
+unmounted volume are one operator mistake wearing two costumes, and they should not produce two
+different-looking failures.
+
+But the drill exposed a defect it did not test. `force=true` plus a **nonexistent** directory would
+have deleted the entire ledger, announced by a single WARN — so the zero-docs branch now splits by
+cause:
+
+| cause | `force` |
+| --- | --- |
+| directory absent | **ignored** — refuse regardless |
+| directory exists, no markdown | honoured |
+| plan deletes >50% of the ledger | honoured |
+
+`force` means *"I have looked at the corpus and I mean to delete these documents"* — a sentence with a
+subject only when there was something to look at. A path that cannot be opened is what a typo, an
+unmounted volume and a missing bind mount all look like. The empty directory is what makes intent
+expressible: creating one is an affirmative act that cannot happen by typo, so `mkdir` + `force` is a
+two-step declaration whose steps fail independently.
+
+Unreadable directories, path-is-a-file and disk errors deliberately stay a hard failure rather than
+routing to the guard, because the guard's advice ends in `-Daura.ingest.force=true` — an instruction
+to force-delete the corpus over a permissions blip.
+
+### The canary had to move twice
+
+Ingestion is now automatic, so a policy edit rebuilds chunks — and the Day 14 canary was pinned to
+`refund-policy.md#0`, whose band belongs to that exact text. An editor adding one sentence would
+refuse the next boot for a reason unrelated to the embedding space. So the text became a **frozen
+constant**, byte-for-byte what chunk 0 held when the band was measured. The band carried over rather
+than needing a re-run — verified, not assumed: **0.24347983**, in band on the first live boot.
+
+That fixed drift and introduced a duplicate: the canary was a chunk in `kb_chunks`, so a refund query
+matched both it and the passage it was copied from. **V4** moved the vector into `canary_probe`, a
+one-row table with `CHECK (id = 1)`.
+
+The distinction is categorical, not cosmetic. `kb_chunks` is the retrieval **corpus** — every row is a
+candidate answer to a customer question — and the canary is a measuring instrument that happens to
+have the same shape. Separation by *table* rather than by a `WHERE` clause means retrieval cannot
+reach it even by accident, and no future query has to remember to exclude it.
+
+Exactly one line of the pipeline branches. Scan, fingerprint, plan, ledger row and per-document
+transaction stay identical, because a canary on a private code path is a canary that can quietly stop
+being exercised by the machinery it exists to watch.
+
+Two mechanical traps, both of which would have silently disabled the guard:
+
+- **The fingerprint would have blocked its own fix.** Deleting the canary's chunk does not move its
+  fingerprint, so the next run reports it `unchanged`, writes nothing, and leaves `canary_probe`
+  empty forever. The migration invalidates the fingerprint — the ledger being made to tell the truth.
+- **The boot check would have deadlocked the run that populates it.** The check is a
+  `SmartInitializingSingleton` (refresh); the pipeline is an `ApplicationRunner` (post-refresh). On
+  the first V4 boot the check necessarily runs first and finds nothing, so an absent probe must skip,
+  not fail.
+
+### What this day did not do
+
+- **`voyage.max-chunk-chars` and `overlap-chars` are not in the fingerprint.** Changing either
+  re-chunks the corpus without moving any hash. Caught today only because it is a config diff a human
+  reads; bump `CHUNKER_VERSION` by hand. Folding them in would make a pure function depend on
+  `VoyageProperties`, and that trade has not been argued.
+- **No admin endpoint.** An unauthenticated endpoint that can rewrite the knowledge base is a
+  guardrails problem; parked until Day 18 puts authentication in front of it.
+- **`embeddingCalls` under-reports retries.** It counts calls on the attempt that succeeded, so the
+  provider bills twice for a retried batch and the report says once. Deliberate: the number exists to
+  prove *no work happened*, and a retry count would blur the zero it must be able to report.
+- **One pool still serves both workloads.** Day 14's FINDING 3 remains open — ingestion is no longer
+  one-shot, though its unit of work is one document and the long part is outside the transaction.
+
+### Commands
+
+```bash
+./mvnw spring-boot:run -Daura.ingest.enabled=true
+```
+
+```bash
+./mvnw spring-boot:run -Daura.ingest.enabled=true -Daura.ingest.force=true
 ```

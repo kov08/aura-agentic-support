@@ -63,6 +63,7 @@ class PgVectorSchemaIT {
             DockerImageName.parse("pgvector/pgvector:pg17").asCompatibleSubstituteFor("postgres"));
 
     @Autowired ChunkRepository repository;
+    @Autowired DocumentRepository documents;
     @Autowired JdbcTemplate jdbc;
     @Autowired EmbeddingProperties embeddingProps;
 
@@ -73,6 +74,10 @@ class PgVectorSchemaIT {
     @BeforeEach
     void clean() {
         repository.deleteAllInBatch();
+        // Parents second: ON DELETE CASCADE would take the chunks with them anyway, but wiping the
+        // children explicitly first keeps this method's effect independent of the constraint it is
+        // partly here to test.
+        documents.deleteAllInBatch();
     }
 
     // ---------------------------------------------------------------- the migrations themselves
@@ -90,10 +95,13 @@ class PgVectorSchemaIT {
                 """);
 
         assertThat(applied)
-                .as("V1 (extension) and V2 (table) must both be recorded as applied")
-                .hasSize(2);
+                .as("V1 (extension), V2 (kb_chunks) and V3 (kb_documents + the FK) must all be "
+                        + "recorded as applied")
+                .hasSize(4);
         assertThat(applied.get(0)).containsEntry("version", "1").containsEntry("success", true);
         assertThat(applied.get(1)).containsEntry("version", "2").containsEntry("success", true);
+        assertThat(applied.get(2)).containsEntry("version", "3").containsEntry("success", true);
+        assertThat(applied.get(3)).containsEntry("version", "4").containsEntry("success", true);
 
         // V1's actual effect, checked directly — a migration recorded as successful and an extension
         // that is actually enabled are two different claims.
@@ -176,13 +184,15 @@ class PgVectorSchemaIT {
         // correctly rather than that Postgres is enforcing anything.
         float[] tooShort = new float[512];
         tooShort[0] = 1.0f;
+        UUID documentId = KbFixtures.documentId(documents, "wrong-dimension.md");
 
         assertThatThrownBy(() -> jdbc.update("""
                 INSERT INTO kb_chunks
-                    (id, source_doc, chunk_index, breadcrumb, content, token_count, embedding, embedding_model)
-                VALUES (?, ?, ?, ?, ?, ?, CAST(? AS vector), ?)
+                    (id, document_id, source_doc, chunk_index, breadcrumb, content, token_count,
+                     embedding, embedding_model)
+                VALUES (?, ?, ?, ?, ?, ?, ?, CAST(? AS vector), ?)
                 """,
-                UUID.randomUUID(), "wrong-dimension.md", 0, "Wrong > Dimension",
+                UUID.randomUUID(), documentId, "wrong-dimension.md", 0, "Wrong > Dimension",
                 "a vector of the wrong width", 7, VectorLiterals.toLiteral(tooShort), "test-model"))
                 .as("a 512-dimension vector must not fit a vector(1024) column")
                 .hasMessageContaining("expected " + DIM + " dimensions");
@@ -255,6 +265,86 @@ class PgVectorSchemaIT {
                 .isNotNull();
     }
 
+    // ---------------------------------------------------------------- the document ledger (V3)
+
+    @Test
+    void deletingADocumentTakesItsChunksWithIt() {
+        // The guardrail half of Day 15's belt-and-braces. IngestionPipeline deletes a document's
+        // chunks explicitly before deleting the document — that is the belt, and it lives in Java
+        // where a refactor can lose it. This is the braces, and it lives in the schema where a
+        // refactor cannot: after ON DELETE CASCADE, an orphaned chunk is not merely unlikely, it is
+        // unrepresentable.
+        repository.saveAll(List.of(
+                chunk("doomed.md", 0, "Doomed > One", unit(0)),
+                chunk("doomed.md", 1, "Doomed > Two", unit(1)),
+                chunk("survivor.md", 0, "Survivor", unit(2))));
+        UUID doomedId = KbFixtures.documentId(documents, "doomed.md");
+
+        documents.deleteById(doomedId);
+        documents.flush();
+
+        assertThat(repository.findAll())
+                .as("both chunks of the deleted document must be gone, and only those")
+                .extracting(KbChunk::getSourceDoc)
+                .containsExactly("survivor.md");
+    }
+
+    @Test
+    void aChunkCannotBeInsertedWithoutAParentDocument() {
+        // The other half of the same constraint, and the one V3's migration existed to establish:
+        // the Day 13 rows were chunks with no document accounting for them, and after this migration
+        // that state is not reachable.
+        float[] vector = unit(0);
+
+        assertThatThrownBy(() -> jdbc.update("""
+                INSERT INTO kb_chunks
+                    (id, document_id, source_doc, chunk_index, breadcrumb, content, token_count,
+                     embedding, embedding_model)
+                VALUES (?, ?, ?, ?, ?, ?, ?, CAST(? AS vector), ?)
+                """,
+                UUID.randomUUID(), UUID.randomUUID(), "orphan.md", 0, "Orphan", "no parent", 3,
+                VectorLiterals.toLiteral(vector), "voyage-4-large"))
+                .as("a document_id pointing at no kb_documents row must be refused")
+                .hasMessageContaining("kb_chunks_document_id_fkey");
+    }
+
+    @Test
+    void aDocumentPathIsUnique() {
+        // The path IS the document's identity to the pipeline: the plan is a diff of two maps keyed
+        // on it, and a duplicate makes that diff ambiguous in a way no code path handles.
+        KbFixtures.documentId(documents, "refund-policy.md");
+
+        assertThatThrownBy(() -> documents.saveAndFlush(new KbDocument(
+                UUID.randomUUID(), "refund-policy.md", "another-fingerprint",
+                "voyage-4-large", "v1")))
+                .hasMessageContaining("kb_documents_path_key");
+    }
+
+    @Test
+    void theDatabaseWritesBothDocumentTimestampsAndTouchesUpdatedAtOnEveryUpdate() {
+        // One writer per field, and here that writer is Postgres for both. A column DEFAULT covers
+        // the insert; only the BEFORE UPDATE trigger covers the update, which is the half that is
+        // easy to ship missing — nothing fails without it, the value just silently stops moving.
+        UUID id = KbFixtures.documentId(documents, "timestamped.md");
+        KbDocument inserted = documents.findById(id).orElseThrow();
+
+        assertThat(inserted.getCreatedAt()).isNotNull();
+        assertThat(inserted.getUpdatedAt()).isNotNull();
+
+        inserted.advanceTo("a-new-fingerprint", "voyage-4-large", "v2");
+        documents.saveAndFlush(inserted);
+
+        // Read back through JDBC, not through the repository. The in-memory instance is stale by
+        // design (both timestamp columns are insertable=false, updatable=false, so Hibernate never
+        // refreshes them), and a findById would be served from the same persistence context — which
+        // would pass whether or not the trigger exists.
+        assertThat(jdbc.queryForObject(
+                "SELECT updated_at >= created_at AND fingerprint = 'a-new-fingerprint' "
+                        + "FROM kb_documents WHERE id = ?", Boolean.class, id))
+                .as("the BEFORE UPDATE trigger must move updated_at when the row changes")
+                .isTrue();
+    }
+
     @Test
     void twoChunksAtTheSamePositionInTheSameDocumentCollide() {
         // The constraint that makes a re-ingestion a conflict instead of a silent duplicate. Without
@@ -276,8 +366,8 @@ class PgVectorSchemaIT {
         return vector;
     }
 
-    private static KbChunk chunk(String sourceDoc, int index, String breadcrumb, float[] embedding) {
-        return new KbChunk(UUID.randomUUID(), sourceDoc, index, breadcrumb,
-                "content of " + breadcrumb, 8, embedding, "voyage-4-large");
+    private KbChunk chunk(String sourceDoc, int index, String breadcrumb, float[] embedding) {
+        return new KbChunk(UUID.randomUUID(), KbFixtures.documentId(documents, sourceDoc), sourceDoc,
+                index, breadcrumb, "content of " + breadcrumb, 8, embedding, "voyage-4-large");
     }
 }

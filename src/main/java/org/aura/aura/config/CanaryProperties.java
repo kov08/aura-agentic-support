@@ -1,8 +1,6 @@
 package org.aura.aura.config;
 
 import jakarta.validation.constraints.AssertTrue;
-import jakarta.validation.constraints.NotBlank;
-import jakarta.validation.constraints.PositiveOrZero;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.validation.annotation.Validated;
 
@@ -30,9 +28,17 @@ import org.springframework.validation.annotation.Validated;
  * noise floor and the band is derived from that sample by a rule fixed BEFORE the numbers existed —
  * see the harness, and see the provenance comment on {@code aura.canary.band} in application.yml.
  *
- * @param sourceDoc  the canary chunk's document, half of the identity {@code kb_chunks} already
- *                   declares unique
- * @param chunkIndex the canary chunk's 0-based position within that document
+ * <h2>What used to be here, and why it is not (V4)</h2>
+ * This record carried {@code sourceDoc} and {@code chunkIndex} — the identity of the canary's row in
+ * {@code kb_chunks}. Both are gone. The probe now lives in {@code canary_probe}, a table whose
+ * {@code CHECK (id = 1)} makes "there is exactly one probe" a schema fact, so there is nothing left to
+ * address and no address left to configure.
+ *
+ * <p>That deletion is worth more than the two lines it saves. A guard that reads its own target out of
+ * configuration can be pointed at the wrong thing by a config edit — which is precisely the class of
+ * silent misconfiguration this guard exists to detect, reintroduced inside the guard itself. The
+ * canary's text is a code constant ({@code CanaryDocument}) and its row is a primary key the schema
+ * pins; neither can drift without a code review.
  */
 @Validated
 @ConfigurationProperties(prefix = "aura.canary")
@@ -41,16 +47,10 @@ public record CanaryProperties(
         /*
          * OFF unless configured on. The default direction matters: this bean's @ConditionalOnProperty
          * is what keeps the check — and its ChunkRepository dependency — out of every context that has
-         * no database, the same mechanism KbCorpusLoader uses. "Absent means off" is what makes a
+         * no database, the same mechanism IngestionPipeline uses. "Absent means off" is what makes a
          * slice test that knows nothing about canaries simply not have one.
          */
         boolean enabled,
-
-        @NotBlank(message = "aura.canary.source-doc must name the document the canary chunk lives in")
-        String sourceDoc,
-
-        @PositiveOrZero(message = "aura.canary.chunk-index is a 0-based position within the document")
-        int chunkIndex,
 
         Band band,
 
