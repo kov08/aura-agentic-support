@@ -148,8 +148,7 @@ class CachedResolutionServiceTest {
     // Anthropic recovers.
     @Test
     void fallbackResolutionIsNeverCached() {
-        Resolution escalated = new Resolution(
-                "escalated to a human", List.of(), ResolutionStatus.ESCALATED_TO_HUMAN, true);
+        Resolution escalated = Resolution.escalatedToHuman();
         stubKey();
         when(retrieval.retrieve(TICKET)).thenReturn(CONTEXT);
         when(cache.get(KEY)).thenReturn(Optional.empty());
@@ -168,8 +167,8 @@ class CachedResolutionServiceTest {
     // same ticket deserves the same escalation tomorrow anyway.
     @Test
     void modelChosenEscalationIsCachedBecauseItIsAKnowledgeAnswer() {
-        Resolution escalating = new Resolution(
-                "I'm escalating this to a specialist.", List.of(), ResolutionStatus.RESOLVED, true);
+        Resolution escalating = Resolution.resolved(
+                "I'm escalating this to a specialist.", List.of(), List.of(), true);
         stubKey();
         when(retrieval.retrieve(TICKET)).thenReturn(CONTEXT);
         when(cache.get(KEY)).thenReturn(Optional.empty());
@@ -261,6 +260,8 @@ class CachedResolutionServiceTest {
     }
 
     private static Resolution resolution(String answer, ResolutionStatus status) {
-        return new Resolution(answer, CONTEXT.sourcesProvided(), status, false);
+        return status == ResolutionStatus.RESOLVED
+                ? Resolution.resolved(answer, CONTEXT.sourcesProvided(), CONTEXT.sourcesProvided(), false)
+                : Resolution.escalatedToHuman();
     }
 }

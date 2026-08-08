@@ -93,11 +93,33 @@ public class CachedResolutionService {
         // inside the resolver would not merely waste a billable embedding — it could return a
         // different result (the corpus is live, and embeddings are not bit-reproducible), and then
         // the entry would be stored under a key describing documents the model never saw.
+        // What comes back is the FINAL, POST-GATE outcome — never the raw model output. The grounding
+        // gates run inside resolve(), so a rejected answer has already been replaced by an escalation
+        // before this line sees it, and there is no code path on which an ungrounded reply or an
+        // unverified citation could be written to Redis and served to someone else tomorrow. That is
+        // a property of WHERE the gates live, not of a check here.
         Resolution fresh = resolver.resolve(ticketText, context);
 
-        // ADR-014 fallbacks are availability answers, not knowledge answers: cache one
-        // and we'd keep escalating tickets for the full TTL after Anthropic recovers.
-        if (!fresh.isEscalatedFallback()) {     // the existing ADR-014 status marker
+        // WHAT IS CACHED, and the Day 16 change: escalations ARE cached now — the grounding ones.
+        //
+        // The gate used to be "never store an ESCALATED_TO_HUMAN result", which was right when the
+        // Resilience4j fallback was that status's only writer: an availability answer cached is a
+        // ticket that keeps escalating for a full TTL after Anthropic recovers. The grounding gates
+        // added two more writers with the opposite property. "The knowledge base does not answer this
+        // question" is not a fact about today's weather — it is a fact about this ticket and this
+        // corpus, it will be just as true in an hour, and re-deriving it costs a full Sonnet call on
+        // exactly the tickets most likely to be asked again.
+        //
+        // WHY THAT CANNOT FOSSILIZE, which is the obvious objection: the key hashes the RETRIEVED
+        // BYTES (Decision 4). Publishing the missing policy document and re-ingesting changes what
+        // this ticket retrieves, which changes its key, which orphans the cached refusal — no TTL to
+        // wait out and no flush to remember. The invalidation that makes caching a refusal safe is
+        // the same mechanism that already makes caching an ANSWER safe; it is not a new promise.
+        //
+        // isIncidentalOutcome() is what keeps the two apart: it is true for a dependency failure and
+        // for an unreadable response (both properties of one call), false for a grounding refusal (a
+        // property of the question). See EscalationCause.
+        if (!fresh.isIncidentalOutcome()) {
             cache.put(key, fresh);
         }
         return fresh;
@@ -136,7 +158,7 @@ public class CachedResolutionService {
      * <h2>Nothing is written to Redis on this path, and not because we remembered</h2>
      * The key is a hash OF the retrieved bytes (Decision 4), so when retrieval fails there is no key
      * to write under. The cache is not skipped by a conditional that a later edit could invert — it
-     * is unreachable. That is a stronger guarantee than the {@code isEscalatedFallback} gate below,
+     * is unreachable. That is a stronger guarantee than the {@code isIncidentalOutcome} gate above,
      * and it is worth having, because caching an availability answer would keep escalating tickets
      * for a full TTL after the dependency recovered.
      */

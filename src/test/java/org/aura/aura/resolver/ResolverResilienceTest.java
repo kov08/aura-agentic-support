@@ -186,14 +186,21 @@ class ResolverResilienceTest {
         verify(client.messages(), never()).create(any(StructuredMessageCreateParams.class));
     }
 
-    // A well-formed Day 10 envelope. The block is a real SDK object wrapping real JSON rather than a
-    // mock, so the typed deserialization the service depends on actually runs in these tests.
+    // A well-formed envelope, Day 16 shape: grounded, and citing the one chunk CONTEXT supplies. It
+    // has to cite a REAL id from that fixture rather than a placeholder — G4 checks every id against
+    // the chunks the request actually carried, so a made-up id here would turn every resilience test
+    // into a grounding escalation and the retry/breaker assertions would be measuring the wrong gate.
+    //
+    // The block is a real SDK object wrapping real JSON rather than a mock, so the typed
+    // deserialization the service depends on actually runs in these tests.
     @SuppressWarnings("unchecked")
     private static StructuredMessage<ResolverOutput> okResponse() {
         StructuredMessage<ResolverOutput> message = mock(StructuredMessage.class);
         when(message.stopReason()).thenReturn(Optional.of(StopReason.END_TURN));
         TextBlock textBlock = TextBlock.builder()
-                .text("{\"reply\":\"Returns are accepted within 30 days.\",\"escalate\":false}")
+                .text("{\"reply\":\"Returns are accepted within 30 days.\",\"citations\":[\""
+                        + CONTEXT.sourcesProvided().getFirst().chunkId()
+                        + "\"],\"escalate\":false,\"grounded\":true}")
                 .citations(List.of())
                 .build();
         when(message.content()).thenReturn(List.of(

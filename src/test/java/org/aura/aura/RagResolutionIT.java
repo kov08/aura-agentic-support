@@ -105,25 +105,39 @@ class RagResolutionIT extends PostgresBackedContext {
         documents.deleteAllInBatch();
     }
 
+    /**
+     * FIXED chunk ids, and Day 16 is what forced them to be.
+     *
+     * <p>Until the grounding gates landed, a chunk's uuid was something only the ledger looked at and
+     * {@code UUID.randomUUID()} was fine. Now a scripted answer has to CITE one, and G4 checks the
+     * citation against the ids the request actually carried — so the id has to be knowable before the
+     * request is made. Written down rather than captured after the save, so the canned response and
+     * the fixture read as one contract instead of one deriving itself from the other.
+     */
+    private static final UUID REFUND_0 = UUID.fromString("00000000-0000-0000-0000-0000000000d1");
+    private static final UUID REFUND_1 = UUID.fromString("00000000-0000-0000-0000-0000000000d2");
+    private static final UUID SHIPPING_0 = UUID.fromString("00000000-0000-0000-0000-0000000000d3");
+    private static final UUID WARRANTY_0 = UUID.fromString("00000000-0000-0000-0000-0000000000d4");
+
     @BeforeEach
     void seedCorpusAndStubs() {
         chunks.deleteAllInBatch();
         chunks.saveAll(List.of(
                 // d = 0.0     — the answer
-                chunk("refund-policy.md", 0, "Refund Policy > Standard Refund Window",
+                chunk(REFUND_0, "refund-policy.md", 0, "Refund Policy > Standard Refund Window",
                         "Customers have 30 days from the delivery date to request a refund.", unit(0)),
                 // d ≈ 0.2929  — refund#0's NEIGHBOUR: ranks second, and is dropped by adjacency dedup
-                chunk("refund-policy.md", 1, "Refund Policy > How To Start A Return",
+                chunk(REFUND_1, "refund-policy.md", 1, "Refund Policy > How To Start A Return",
                         "Start a return from your order history and print the prepaid label.", diagonal(2)),
                 // d ≈ 0.4226  — a distinct document, and the chunk that inherits the freed budget
-                chunk("shipping-policy.md", 0, "Shipping Policy > Delivery Speeds",
+                chunk(SHIPPING_0, "shipping-policy.md", 0, "Shipping Policy > Delivery Speeds",
                         "Standard delivery is 3-5 business days and free over 35 USD.", diagonal(3)),
                 // d = 1.0     — ranks last and does not fit; the budget stops before it
-                chunk("warranty-policy.md", 0, "Warranty Policy > Coverage Period",
+                chunk(WARRANTY_0, "warranty-policy.md", 0, "Warranty Policy > Coverage Period",
                         "Every product carries a 12-month limited warranty.", unit(1))));
 
         when(voyage.embedQuery(anyString())).thenReturn(QUERY_VECTOR);
-        stubClaude("{\"reply\":\"You're within the 30-day window.\",\"escalate\":false}");
+        stubClaude("You're within the 30-day window.", REFUND_0);
     }
 
     // ---------------------------------------------------------------- retrieval reaches the wire
@@ -223,7 +237,7 @@ class RagResolutionIT extends PostgresBackedContext {
         jdbc.update("UPDATE kb_chunks SET content = ? WHERE source_doc = ? AND chunk_index = ?",
                 "Customers have 45 days from the delivery date to request a refund.",
                 "refund-policy.md", 0);
-        stubClaude("{\"reply\":\"You're within the 45-day window.\",\"escalate\":false}");
+        stubClaude("You're within the 45-day window.", REFUND_0);
 
         Resolution afterEdit = resolutions.resolve(new ResolveTicketRequest(TICKET));
 
@@ -243,8 +257,17 @@ class RagResolutionIT extends PostgresBackedContext {
         return captor.getValue();
     }
 
+    /** A grounded Day 16 envelope citing {@code cited} — the ids must be ones retrieval supplied. */
+    private void stubClaude(String reply, UUID... cited) {
+        String ids = java.util.Arrays.stream(cited)
+                .map(id -> "\"" + id + "\"")
+                .collect(java.util.stream.Collectors.joining(",", "[", "]"));
+        stubClaudeRaw("{\"reply\":\"" + reply + "\",\"citations\":" + ids
+                + ",\"escalate\":false,\"grounded\":true}");
+    }
+
     @SuppressWarnings("unchecked")
-    private void stubClaude(String envelopeJson) {
+    private void stubClaudeRaw(String envelopeJson) {
         StructuredMessage<ResolverOutput> message = mock(StructuredMessage.class);
         when(message.stopReason()).thenReturn(java.util.Optional.of(StopReason.END_TURN));
         // A real SDK block wrapping real JSON, so the typed deserialization path runs rather than
@@ -260,11 +283,11 @@ class RagResolutionIT extends PostgresBackedContext {
      * uniform so the packing outcome is decided by the ranking and the dedup rule rather than by an
      * accident of chunk sizes.
      */
-    private KbChunk chunk(String doc, int index, String breadcrumb, String content, float[] vector) {
+    private KbChunk chunk(UUID id, String doc, int index, String breadcrumb, String content, float[] vector) {
         // Day 15: kb_chunks.document_id is a NOT NULL foreign key, so the parent row has to exist and
         // be flushed before this chunk can be inserted. Non-static now for exactly that reason — it
         // needs the repository.
-        return new KbChunk(UUID.randomUUID(), KbFixtures.documentId(documents, doc), doc, index,
+        return new KbChunk(id, KbFixtures.documentId(documents, doc), doc, index,
                 breadcrumb, content, 300, vector, "voyage-4-large");
     }
 

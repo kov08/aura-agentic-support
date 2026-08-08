@@ -92,8 +92,8 @@ final class AnthropicMessages {
 
     // A resolver success whose BODY is delayed — the "hang" simulation. The delay lives in the script;
     // the test asserts an OUTCOME, never elapsed time.
-    static MockResponse resolverOkDelayed(Duration delay) {
-        return resolverOk().setBodyDelay(delay.toMillis(), TimeUnit.MILLISECONDS);
+    static MockResponse resolverOkDelayed(Duration delay, String... citedChunkIds) {
+        return resolverOk(citedChunkIds).setBodyDelay(delay.toMillis(), TimeUnit.MILLISECONDS);
     }
 
     // An Anthropic error response. The SDK maps by HTTP status: 429 -> RateLimitException,

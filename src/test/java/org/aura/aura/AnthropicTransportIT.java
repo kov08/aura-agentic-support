@@ -9,6 +9,9 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.aura.aura.client.VoyageEmbeddingClient;
 import org.aura.aura.client.VoyageTransientException;
+import org.aura.aura.store.ChunkRepository;
+import org.aura.aura.store.DocumentRepository;
+import org.aura.aura.store.KbFixtures;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -103,11 +106,37 @@ class AnthropicTransportIT extends PostgresBackedContext {
      *
      * <p>Stubbed at the Java boundary rather than given a second MockWebServer, because the retrieval
      * leg is not what this class is about and a real embedding call would only add a way for these
-     * tests to fail. {@code kb_chunks} is left empty, so retrieval legitimately returns an empty
-     * document block and the request counts below stay exactly what they were: 1 classifier + N
-     * resolver attempts, all against this server.
+     * tests to fail. The request counts below are unaffected either way: 1 classifier + N resolver
+     * attempts, all against this server — Voyage is not this server.
      */
     @MockitoBean VoyageEmbeddingClient voyage;
+
+    @Autowired ChunkRepository chunks;
+    @Autowired DocumentRepository documents;
+
+    /**
+     * Day 16: {@code kb_chunks} is no longer left empty, and the reason is worth stating because the
+     * previous comment argued the opposite.
+     *
+     * <p>An empty corpus used to be the cheapest way to keep this class about transport: retrieval
+     * returned an empty document block, Claude answered anyway, and the answer came back. The
+     * grounding gates end that — with no excerpts there is no id an answer may cite, so every
+     * scripted 200 below would escalate at G4 and every assertion here would be reading a grounding
+     * outcome while claiming to test a transport one. One excerpt restores the property this class
+     * actually depends on: a scripted success is a success.
+     */
+    @BeforeEach
+    void seedOneExcerpt() {
+        KbFixtures.seedOneGroundingChunk(chunks, documents);
+    }
+
+    /** The container is shared; leave it as it was found (see RagResolutionIT for the full argument). */
+    @AfterAll
+    static void clearSharedCorpus(@Autowired ChunkRepository chunks,
+                                  @Autowired DocumentRepository documents) {
+        chunks.deleteAllInBatch();
+        documents.deleteAllInBatch();
+    }
 
     @BeforeEach
     void isolate() {
@@ -136,7 +165,7 @@ class AnthropicTransportIT extends PostgresBackedContext {
     @Test
     void it1_happyPath_resolved_exactlyTwoRequests() {
         ANTHROPIC.enqueue(classifierOk());
-        ANTHROPIC.enqueue(resolverOk());
+        ANTHROPIC.enqueue(resolverOk(KbFixtures.GROUNDING_CHUNK_ID.toString()));
         int before = ANTHROPIC.getRequestCount();
 
         ResponseEntity<String> resp = resolve(rest, "it1", "Where is my order #88231?");
@@ -152,7 +181,7 @@ class AnthropicTransportIT extends PostgresBackedContext {
         ANTHROPIC.enqueue(classifierOk());
         ANTHROPIC.enqueue(error(429, "rate_limit_error", "slow down"));
         ANTHROPIC.enqueue(error(429, "rate_limit_error", "slow down"));
-        ANTHROPIC.enqueue(resolverOk());
+        ANTHROPIC.enqueue(resolverOk(KbFixtures.GROUNDING_CHUNK_ID.toString()));
         int before = ANTHROPIC.getRequestCount();
 
         ResponseEntity<String> resp = resolve(rest, "it2", "Transient recovery scenario ticket");
@@ -244,9 +273,9 @@ class AnthropicTransportIT extends PostgresBackedContext {
         // One delayed resolver response per retry attempt; each body is delayed 2s > the 500ms test
         // timeout, so every attempt times out (AnthropicIoException, a transient) and retries exhaust.
         Duration overTimeout = Duration.ofSeconds(2);
-        ANTHROPIC.enqueue(resolverOkDelayed(overTimeout));
-        ANTHROPIC.enqueue(resolverOkDelayed(overTimeout));
-        ANTHROPIC.enqueue(resolverOkDelayed(overTimeout));
+        ANTHROPIC.enqueue(resolverOkDelayed(overTimeout, KbFixtures.GROUNDING_CHUNK_ID.toString()));
+        ANTHROPIC.enqueue(resolverOkDelayed(overTimeout, KbFixtures.GROUNDING_CHUNK_ID.toString()));
+        ANTHROPIC.enqueue(resolverOkDelayed(overTimeout, KbFixtures.GROUNDING_CHUNK_ID.toString()));
 
         ResponseEntity<String> resp = resolve(rest, "it5", "Hang conversion scenario ticket");
 

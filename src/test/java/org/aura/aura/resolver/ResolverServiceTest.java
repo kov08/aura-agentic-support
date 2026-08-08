@@ -19,9 +19,11 @@ import org.junit.jupiter.api.Test;
 import org.springframework.core.io.ClassPathResource;
 
 import java.io.IOException;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.stream.Collectors;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -86,7 +88,7 @@ class ResolverServiceTest {
     // block that produced the request. Not re-derived, not re-sorted, not filtered.
     @Test
     void resolve_recordsExactlyTheSurvivorsFromTheContextBlock() {
-        stubResponse(StopReason.END_TURN, "{\"reply\":\"Within 30 days.\",\"escalate\":false}");
+        stubResponse(StopReason.END_TURN, envelope("Within 30 days.", false, true, REFUND_ID, SHIPPING_ID));
         ContextBlock context = context(
                 chunk(REFUND_ID, "Refund Policy", "Customers have 30 days.", 0.11),
                 chunk(SHIPPING_ID, "Shipping Policy", "Five to seven days.", 0.29));
@@ -113,9 +115,9 @@ class ResolverServiceTest {
         // Getting this wrong is not a cosmetic bug: a citation list assembled from the model's prose
         // is a list the model can hallucinate, and a hallucinated citation is worse than none at all
         // because it looks like evidence.
-        stubResponse(StopReason.END_TURN,
-                "{\"reply\":\"According to the Warranty Policy and section 4 of the Returns Guide, "
-                        + "you have 30 days.\",\"escalate\":false}");
+        stubResponse(StopReason.END_TURN, envelope(
+                "According to the Warranty Policy and section 4 of the Returns Guide, you have 30 days.",
+                false, true, REFUND_ID));
         ContextBlock context = context(chunk(REFUND_ID, "Refund Policy", "Customers have 30 days.", 0.11));
 
         Resolution resolution = resolver().resolve(RETURNS_TICKET, context);
@@ -126,15 +128,28 @@ class ResolverServiceTest {
     }
 
     @Test
-    void resolve_anEmptyRetrievalYieldsAnHonestlyEmptyLedger() {
-        // Retrieval whiffed, and the model answered with full confidence anyway. The receipt stays
-        // empty, which is what makes an empty receipt on a confident answer a usable smell.
+    void resolve_anEmptyRetrievalCanNoLongerProduceAConfidentAnswer() {
+        // THE DAY 16 INVERSION, and the clearest single statement of what changed.
+        //
+        // This test used to assert that a whiffed retrieval plus a confidently-answering model
+        // produced an empty receipt — "which is what makes an empty receipt on a confident answer a
+        // usable smell". A smell is something a human notices later. The gates turn it into an
+        // outcome: there were no excerpts, so there is no id the model could legitimately cite, so
+        // G4 cannot pass, and the answer never leaves the building.
+        //
+        // The model here is behaving as badly as it can within the schema — grounded=true on a
+        // question nothing in the request could answer — and the assertion is that this is now
+        // structurally unable to reach a customer rather than merely detectable afterwards.
         stubResponse(StopReason.END_TURN,
-                "{\"reply\":\"ShopFast accepts returns within 30 days.\",\"escalate\":false}");
+                envelope("ShopFast accepts returns within 30 days.", false, true));
 
         Resolution resolution = resolver().resolve("Who is ShopFast's CEO?", context());
 
+        assertThat(resolution.status()).isEqualTo(ResolutionStatus.ESCALATED_TO_HUMAN);
+        assertThat(resolution.escalationCause()).isEqualTo(EscalationCause.UNVERIFIABLE_CITATIONS);
+        assertThat(resolution.answer()).doesNotContain("30 days");
         assertThat(resolution.sourcesProvided()).isEmpty();
+        assertThat(resolution.sourcesCited()).isEmpty();
     }
 
     // ---------------------------------------------------------------- the escalation channels
@@ -144,22 +159,31 @@ class ResolverServiceTest {
     // were indistinguishable to any caller.
     @Test
     void resolve_copiesTheModelsEscalateVerdict() {
-        stubResponse(StopReason.END_TURN,
-                "{\"reply\":\"I'm escalating this to a specialist.\",\"escalate\":true}");
+        // GROUNDED AND ESCALATING AT THE SAME TIME, which is the combination worth pinning: an answer
+        // fully supported by the excerpts can still need a person (money in dispute, an action only a
+        // human can take). Day 16 must not have collapsed those two channels into one — a gate that
+        // treated escalate=true as "not a real answer" would throw away the cited evidence that makes
+        // the handoff useful to the agent picking it up.
+        stubResponse(StopReason.END_TURN, envelope(
+                "Your return is within the window; I'm escalating this to a specialist to process it.",
+                true, true, REFUND_ID));
 
-        Resolution escalating = resolver().resolve(RETURNS_TICKET, context());
+        Resolution escalating = resolver().resolve(RETURNS_TICKET, groundedContext());
 
         assertThat(escalating.escalate()).isTrue();
-        // Still RESOLVED: the model chose to escalate on a HEALTHY call. ESCALATED_TO_HUMAN would mean
-        // the dependency failed, which is a different fact on a different channel.
+        // Still RESOLVED: the model chose to escalate on a HEALTHY, GROUNDED call. ESCALATED_TO_HUMAN
+        // would mean either the dependency failed or the grounding gates fired — different facts on
+        // different channels.
         assertThat(escalating.status()).isEqualTo(ResolutionStatus.RESOLVED);
+        assertThat(escalating.escalationCause()).isEqualTo(EscalationCause.NONE);
+        assertThat(escalating.sourcesCited()).extracting(SourceRef::chunkId).containsExactly(REFUND_ID);
     }
 
     @Test
     void resolve_carriesEscalateFalseThrough() {
-        stubResponse(StopReason.END_TURN, "{\"reply\":\"Within 30 days.\",\"escalate\":false}");
+        stubResponse(StopReason.END_TURN, envelope("Within 30 days.", false, true, REFUND_ID));
 
-        assertThat(resolver().resolve(RETURNS_TICKET, context()).escalate()).isFalse();
+        assertThat(resolver().resolve(RETURNS_TICKET, groundedContext()).escalate()).isFalse();
     }
 
     // A truncated or refused response has no usable reply, and the resolver has no honest neutral
@@ -269,6 +293,24 @@ class ResolverServiceTest {
 
     private ContextBlock context(RetrievedChunk... chunks) {
         return assembler.assemble(List.of(chunks));
+    }
+
+    /** The default one-excerpt context, so a test that is not ABOUT retrieval can still pass G4. */
+    private ContextBlock groundedContext() {
+        return context(chunk(REFUND_ID, "Refund Policy", "Customers have 30 days.", 0.11));
+    }
+
+    /**
+     * A Day 16 envelope, built rather than hand-written, because the citation ids have to agree with
+     * a {@link ContextBlock} fixture and a typo in a uuid string is a silent G4 escalation rather
+     * than a compile error.
+     */
+    private static String envelope(String reply, boolean escalate, boolean grounded, UUID... citations) {
+        String ids = Arrays.stream(citations)
+                .map(id -> "\"" + id + "\"")
+                .collect(Collectors.joining(",", "[", "]"));
+        return "{\"reply\":\"" + reply + "\",\"citations\":" + ids
+                + ",\"escalate\":" + escalate + ",\"grounded\":" + grounded + "}";
     }
 
     private static RetrievedChunk chunk(UUID id, String breadcrumb, String content, double distance) {

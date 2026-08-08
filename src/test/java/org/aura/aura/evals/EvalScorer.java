@@ -87,7 +87,14 @@ public final class EvalScorer {
         boolean classifierDegraded = classification.reason() == ReviewReason.DEPENDENCY_UNAVAILABLE;
         // The resolver stage is degraded ONLY on the availability channel. A model-chosen escalate=true
         // on a healthy call is RESOLVED and stays fully graded.
-        boolean resolverDegraded = resolution.status() == ResolutionStatus.ESCALATED_TO_HUMAN;
+        //
+        // Day 16 moved this OFF `status` and onto the cause, and getting it wrong would have been
+        // silent and total. The grounding gates made ESCALATED_TO_HUMAN reachable on a perfectly
+        // healthy call — a correct refusal on an unanswerable ticket lands there — so the old
+        // status test would have marked every correct refusal DEGRADED and excluded it from scoring.
+        // The unanswerable slice added today exists to measure exactly those tickets; it would have
+        // reported 0/0 and read like a dimension that passed.
+        boolean resolverDegraded = resolution.isIncidentalOutcome();
 
         // --- classifier stage (strict exact enum match) ---
         Boolean categoryMatch = null, urgencyMatch = null, intentMatch = null;

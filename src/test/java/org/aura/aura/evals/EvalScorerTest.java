@@ -62,10 +62,13 @@ class EvalScorerTest {
      * <p>The uuid and distance are filler here for the same reason: the scorer never reads them.
      */
     private static Resolution resolved(String reply, List<String> sources, boolean escalate) {
-        return new Resolution(
-                reply,
-                sources.stream().map(s -> new SourceRef(UUID.randomUUID(), s, 0.2)).toList(),
-                ResolutionStatus.RESOLVED, escalate);
+        // Day 16: the same refs go in BOTH lists. The scorer's sources dimension grades
+        // citedBreadcrumbs, and on a real RESOLVED answer every cited chunk is by construction one
+        // that was provided (G4 rejects anything else) — so a fixture where they disagreed would be
+        // a shape the pipeline cannot produce.
+        List<SourceRef> refs = sources.stream()
+                .map(s -> new SourceRef(UUID.randomUUID(), s, 0.2)).toList();
+        return Resolution.resolved(reply, refs, refs, escalate);
     }
 
     // ---- happy path -----------------------------------------------------------------------------
@@ -351,8 +354,7 @@ class EvalScorerTest {
 
     @Test
     void resolverEscalatedFallback_excludesResolverFieldsButStillGradesClassifier() {
-        Resolution degraded = new Resolution(
-                "escalated to a human", List.of(), ResolutionStatus.ESCALATED_TO_HUMAN, true);
+        Resolution degraded = Resolution.escalatedToHuman();
 
         TicketScore s = scorer.score(
                 ticket(baselineLabel(List.of("kb-returns"), List.of("escalat"), List.of())),
@@ -373,8 +375,7 @@ class EvalScorerTest {
         ClassificationResult cDeg = new ClassificationResult(
                 new TicketClassification(TicketCategory.OTHER, TicketUrgency.MEDIUM, TicketIntent.GET_INFORMATION, 0.0),
                 true, ReviewReason.DEPENDENCY_UNAVAILABLE);
-        Resolution rDeg = new Resolution(
-                "escalated", List.of(), ResolutionStatus.ESCALATED_TO_HUMAN, true);
+        Resolution rDeg = Resolution.escalatedToHuman();
 
         TicketScore s = scorer.score(ticket(baselineLabel(null, List.of(), List.of())), cDeg, rDeg);
 

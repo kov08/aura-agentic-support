@@ -70,7 +70,7 @@ class ResolutionCacheTest {
     // CacheKeyFactory hashes the system prompt — but that protects only THIS migration, not the next.)
     @Test
     void escalateSurvivesTheCacheRoundTrip() {
-        Resolution escalating = new Resolution("a human will take this", List.of(), ResolutionStatus.RESOLVED, true);
+        Resolution escalating = Resolution.resolved("a human will take this", List.of(), List.of(), true);
         when(redis.opsForValue()).thenReturn(valueOps);
         when(valueOps.get(KEY)).thenReturn(objectMapper.writeValueAsString(escalating));
 
@@ -80,9 +80,8 @@ class ResolutionCacheTest {
     // A failed write is swallowed: the caller already has a full-price answer to return.
     @Test
     void redisWriteFailureDoesNotPropagate() {
-        Resolution value = new Resolution("answer",
-                List.of(new SourceRef(UUID.randomUUID(), "Refund Policy", 0.19)),
-                ResolutionStatus.RESOLVED, false);
+        SourceRef refund = new SourceRef(UUID.randomUUID(), "Refund Policy", 0.19);
+        Resolution value = Resolution.resolved("answer", List.of(refund), List.of(refund), false);
         when(redis.opsForValue()).thenReturn(valueOps);
         doThrow(new RedisConnectionFailureException("redis down"))
                 .when(valueOps).set(anyString(), anyString(), any(Duration.class));

@@ -7,6 +7,10 @@ import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.aura.aura.client.VoyageEmbeddingClient;
+import org.aura.aura.store.ChunkRepository;
+import org.aura.aura.store.DocumentRepository;
+import org.aura.aura.store.KbFixtures;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
@@ -79,6 +83,23 @@ class RedisDegradationIT extends PostgresBackedContext {
     // fake server here is the Anthropic one. See that class for the full note.
     @MockitoBean VoyageEmbeddingClient voyage;
 
+    @Autowired ChunkRepository chunks;
+    @Autowired DocumentRepository documents;
+
+    /** Day 16: one citable excerpt, or the scripted success below escalates at G4 (see KbFixtures). */
+    @BeforeEach
+    void seedOneExcerpt() {
+        KbFixtures.seedOneGroundingChunk(chunks, documents);
+    }
+
+    /** The Postgres container is shared even though this class owns its Redis; leave the corpus clean. */
+    @AfterAll
+    static void clearSharedCorpus(@Autowired ChunkRepository chunks,
+                                  @Autowired DocumentRepository documents) {
+        chunks.deleteAllInBatch();
+        documents.deleteAllInBatch();
+    }
+
     @BeforeEach
     void setup() {
         // Full width — see the note in AnthropicTransportIT: the Postgres is shared, so a short vector
@@ -96,7 +117,7 @@ class RedisDegradationIT extends PostgresBackedContext {
 
         // (1) First time: cache MISS → real pipeline → answer, then cached. [clf, res] = 2 requests.
         ANTHROPIC.enqueue(classifierOk());
-        ANTHROPIC.enqueue(resolverOk());
+        ANTHROPIC.enqueue(resolverOk(KbFixtures.GROUNDING_CHUNK_ID.toString()));
         int start = ANTHROPIC.getRequestCount();
         ResponseEntity<String> first = resolve(rest, TICKET, MESSAGE);
         assertThat(first.getStatusCode().value()).isEqualTo(200);
@@ -109,7 +130,7 @@ class RedisDegradationIT extends PostgresBackedContext {
         // Redis down the cache fails OPEN to a MISS, so the pipeline recomputes. Enqueue identical
         // canned responses so the recomputed answer is byte-identical to the cached one.
         ANTHROPIC.enqueue(classifierOk());
-        ANTHROPIC.enqueue(resolverOk());
+        ANTHROPIC.enqueue(resolverOk(KbFixtures.GROUNDING_CHUNK_ID.toString()));
         ResponseEntity<String> second = resolve(rest, TICKET, MESSAGE);
         assertThat(second.getStatusCode().value()).isEqualTo(200);
 

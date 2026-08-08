@@ -352,6 +352,17 @@ resilience4j:
           - com.anthropic.errors.RateLimitException     # HTTP 429 — rate limited
           - com.anthropic.errors.InternalServerException # HTTP 5xx incl. 529 overloaded
           - com.anthropic.errors.AnthropicIoException    # connection reset / socket timeout (no HTTP status)
+          # Day 16, GATE 0. The odd one out: not a transport failure at all — a 200 arrived, promptly,
+          # carrying something no ResolverOutput could be read out of. It is listed because retrying is
+          # genuinely likely to work where retrying a 400 is not: resolve() is a pure read at
+          # temperature 1.0, so the next attempt is a different draw from the same distribution rather
+          # than the same request meeting the same deterministic refusal.
+          #
+          # Note it is deliberately ABSENT from the breaker's record-exceptions below. That asymmetry
+          # is the whole design: this exception says the MODEL misbehaved, and the breaker exists to
+          # track whether the DEPENDENCY is up. Recording it would let a bad prompt edit trip a breaker
+          # that the classifier shares, taking down a healthy call path over a formatting problem.
+          - org.aura.aura.resolver.ResolverOutputUnusableException
       # Day 12 — the Voyage embeddings API. Resilience4j is the SINGLE retry owner here too: the
       # RestClient inside VoyageEmbeddingClient has no retry of its own, for the same reason the
       # Anthropic SDK is pinned to maxRetries(0) — layered retries multiply (3 × 3 = 9 calls), they
