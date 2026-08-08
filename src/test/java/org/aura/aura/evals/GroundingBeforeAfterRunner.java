@@ -76,7 +76,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * {@code mvn test -Pevals}, which needs live ANTHROPIC_API_KEY and VOYAGE_API_KEY.
  */
 @Tag("eval")
-@ActiveProfiles("test")
+@ActiveProfiles({"test", "evals"})
 @SpringBootTest(
         webEnvironment = SpringBootTest.WebEnvironment.NONE,
         properties = "aura.ingest.enabled=true")

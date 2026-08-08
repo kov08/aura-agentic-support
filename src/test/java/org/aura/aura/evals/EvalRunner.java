@@ -49,7 +49,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * a truncation, a transport fault), which lands in the ERRORED bucket.
  */
 @Tag("eval")
-@ActiveProfiles("test")   // suppresses ConversationRunner (@Profile("!test")), which would fire its own live call
+@ActiveProfiles({"test", "evals"})   // "evals" adds the patient Voyage retry budget; "test" suppresses ConversationRunner (@Profile("!test")), which would fire its own live call
 @SpringBootTest(
         webEnvironment = SpringBootTest.WebEnvironment.NONE,
         // Day 14: an eval that scores a RAG system has to actually retrieve, so the corpus is ingested
