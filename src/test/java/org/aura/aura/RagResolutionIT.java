@@ -120,6 +120,36 @@ class RagResolutionIT extends PostgresBackedContext {
     private static final UUID SHIPPING_0 = UUID.fromString("00000000-0000-0000-0000-0000000000d3");
     private static final UUID WARRANTY_0 = UUID.fromString("00000000-0000-0000-0000-0000000000d4");
 
+    /**
+     * FLUSH REDIS BETWEEN METHODS, explicitly — and the story of why this line had to be added is
+     * worth more than the line.
+     *
+     * <p>Every method in this class resolves the SAME ticket against the SAME corpus, so they all
+     * compute the same cache key and the second one onward would be served from the first one's
+     * entry. That was already true before Day 16 and the class passed anyway, for a reason nobody
+     * chose: the fixture used {@code UUID.randomUUID()} for chunk ids, those ids are rendered into
+     * the {@code <document id="...">} attributes, and the rendered block is hashed into the key
+     * (Decision 4) — so every method silently got its own keyspace.
+     *
+     * <p>Day 16 needed the ids to be FIXED, because a scripted answer now has to cite one and G4
+     * checks it. That removed the accidental isolation, and four methods failed at once: two saw
+     * "zero interactions with the Anthropic mock", one saw a RESOLVED where the scripted response
+     * said grounded=false. Every one of those was a cache hit from the previous method.
+     *
+     * <p>So the isolation is now DECLARED rather than inherited from a random number. It is the
+     * better arrangement regardless: an isolation property that holds because ids happen to be random
+     * is one that disappears the moment anyone needs a deterministic id, which is exactly what
+     * happened. Note the class also keeps its own Redis container ({@code @Container} above) for the
+     * same reason at a coarser grain — that stops a PREVIOUS RUN leaking in; this stops the previous
+     * METHOD doing it.
+     */
+    @BeforeEach
+    void clearResponseCache() {
+        redis.getConnectionFactory().getConnection().serverCommands().flushDb();
+    }
+
+    @Autowired org.springframework.data.redis.core.StringRedisTemplate redis;
+
     @BeforeEach
     void seedCorpusAndStubs() {
         chunks.deleteAllInBatch();
