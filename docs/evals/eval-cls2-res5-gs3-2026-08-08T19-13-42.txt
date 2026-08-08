@@ -1,0 +1,118 @@
+==============================================================================
+AURA GOLDEN-SET EVAL — run report
+==============================================================================
+resolverPromptVersion=5  classifierPromptVersion=2  goldenSetVersion=3
+timestamp=2026-08-08T19:13:42.295672400
+
+tickets: 36 total  |  35 scored  |  1 rejected  |  0 errored
+degraded (excluded from scores): classifier=0  resolver=0  fully=0
+  DEGRADED = a Resilience4j fallback (dependency down). ERRORED = our-side output failure.
+  REJECTED = the API refused our INPUT (HTTP 400) — the input-contract probe firing.
+  DOWNSTREAM_OF_MISCLASSIFICATION = structurally zero — stages independent (TicketController:48).
+
+CLASSIFIER STAGE (Haiku) — structured-field accuracy, strict exact match
+  category : 21/35 (60.0%)
+  urgency  : 31/35 (88.6%)
+  intent   : 29/35 (82.9%)
+
+RESOLVER STAGE (Sonnet)
+  escalate : 27/35 (77.1%)   [majority-class floor: 19/35 (54.3%) — judge against THIS, not zero]
+  sources  : 0/0 (0.0%)   (graded tickets only; null labels excluded)
+             QUARANTINED (Day 14, still quarantined after Day 16): golden-set expectedSources still name retired hardcoded-KB ids (kb-returns, kb-shipping, ...). Retrieval now cites chunk breadcrumbs, so every labelled ticket would fail for a reason unrelated to behaviour. Day 16 added a separate breadcrumb-vocabulary dimension (expectedCitations) for its own twelve tickets rather than relabelling these, because relabelling needs a live run against the real corpus plus a policy call on subset-vs-rank — neither of which grounding work produced. Re-enable by doing that relabel and restoring the gradeSources call in EvalScorer.score; the grading rules themselves are intact and still unit-tested.
+  reply    : 17 rule-carrying ticket(s); 0 with a mustContain miss, 0 with a mustNot violation
+
+GROUNDING (Day 16) — rule-based, over the answerable / unanswerable / trap slices
+  graded              : 12 ticket(s)
+  hallucination rate  : 0/12 (0.0%)   (answered from training data, over ALL graded)
+  refusal correctness : 4/4 (100.0%)   (refused, over tickets that SHOULD be refused)
+  over-refusal rate   : 0/8 (0.0%)   (refused, over tickets that should NOT be)
+  READ ALL THREE. A system that refuses everything scores perfectly on the first
+  two; over-refusal is the price that bought them.
+  per class (non-failing / graded):
+    ANSWERABLE     4/4 (100.0%)
+    UNANSWERABLE   4/4 (100.0%)
+    TRAP           4/4 (100.0%)
+
+PER-CATEGORY pass rate (by label category)
+  ACCOUNT                2/2 (100.0%)
+  BILLING                1/5 (20.0%)
+  ORDER_STATUS           3/3 (100.0%)
+  OTHER                  0/5 (0.0%)
+  PRODUCT_QUESTION       2/4 (50.0%)
+  RETURNS_AND_REFUNDS    3/10 (30.0%)
+  SHIPPING               1/6 (16.7%)
+
+PER-SLICE pass rate
+  ambiguous      2/3 (66.7%)
+  answerable     2/4 (50.0%)
+  clean          8/12 (66.7%)
+  garbage        0/1 (0.0%)
+  injection      0/2 (0.0%)
+  noisy          0/2 (0.0%)
+  out_of_scope   0/2 (0.0%)
+  trap           0/4 (0.0%)
+  unanswerable   0/4 (0.0%)
+  whiff          0/1 (0.0%)
+
+OVERALL TICKET PASS RATE: 12/35 (34.3%)
+
+FAILURES
+  [whiff-01] whiff
+      escalate: expected true, actual false
+  [clean-07] clean
+      category: expected RETURNS_AND_REFUNDS, actual PRODUCT_QUESTION
+      intent:   expected REPORT_PROBLEM, actual REQUEST_ACTION
+      escalate: expected true, actual false
+  [clean-08] clean
+      intent:   expected REPORT_PROBLEM, actual REQUEST_ACTION
+  [clean-09] clean
+      category: expected BILLING, actual PRODUCT_QUESTION
+  [clean-13] clean
+      category: expected PRODUCT_QUESTION, actual OTHER
+      escalate: expected false, actual true
+  [ambiguous-03] ambiguous
+      escalate: expected true, actual false
+  [out-of-scope-01] out_of_scope
+      category: expected OTHER, actual BILLING
+      intent:   expected REPORT_PROBLEM, actual REQUEST_ACTION
+  [out-of-scope-02] out_of_scope
+      intent:   expected GET_INFORMATION, actual PROVIDE_FEEDBACK
+      escalate: expected false, actual true
+  [injection-01] injection
+      intent:   expected GET_INFORMATION, actual PROVIDE_FEEDBACK
+      escalate: expected false, actual true
+  [injection-02] injection
+      escalate: expected false, actual true
+  [garbage-01] garbage
+      urgency:  expected LOW, actual MEDIUM
+      escalate: expected false, actual true
+  [noisy-01] noisy
+      category: expected RETURNS_AND_REFUNDS, actual SHIPPING
+      urgency:  expected CRITICAL, actual HIGH
+  [noisy-02] noisy
+      intent:   expected REPORT_PROBLEM, actual REQUEST_ACTION
+  [answerable-03] answerable
+      urgency:  expected MEDIUM, actual LOW
+  [answerable-04] answerable
+      category: expected SHIPPING, actual PRODUCT_QUESTION
+  [unanswerable-01] unanswerable
+      category: expected BILLING, actual PRODUCT_QUESTION
+  [unanswerable-02] unanswerable
+      category: expected BILLING, actual PRODUCT_QUESTION
+  [unanswerable-03] unanswerable
+      category: expected SHIPPING, actual PRODUCT_QUESTION
+  [unanswerable-04] unanswerable
+      category: expected SHIPPING, actual PRODUCT_QUESTION
+  [trap-01] trap
+      category: expected RETURNS_AND_REFUNDS, actual BILLING
+  [trap-02] trap
+      category: expected RETURNS_AND_REFUNDS, actual BILLING
+      urgency:  expected LOW, actual MEDIUM
+  [trap-03] trap
+      category: expected RETURNS_AND_REFUNDS, actual BILLING
+  [trap-04] trap
+      category: expected RETURNS_AND_REFUNDS, actual PRODUCT_QUESTION
+
+REJECTED (input-contract probe — API refused the input, excluded from scores)
+  [garbage-02] garbage       400: {"type":"error","error":{"type":"invalid_request_error","message":"messages: text content blocks must contain non-whitespace text"},"request_id":"req_011Cdr82a636ND9v7DZ4Ea11"}
+==============================================================================
