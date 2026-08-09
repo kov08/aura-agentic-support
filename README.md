@@ -1224,3 +1224,137 @@ Two mechanical traps, both of which would have silently disabled the guard:
 ```bash
 ./mvnw spring-boot:run -Daura.ingest.enabled=true -Daura.ingest.force=true
 ```
+
+## Day 16 — Grounding: a contract, two hard gates, and the bill they came with
+
+The resolver was handed retrieved context on Day 14 and nothing made it obey. The prompt asked; an
+instruction is a request a model may decline. Today adds a contract it can read and two gates it
+cannot argue with — and, because those gates are structural rather than semantic, a measured account
+of what they do and do not buy.
+
+`ResolverOutput` widens to four fields, pinned from both ends. `reply` stays FIRST because the SSE
+extractor forwards its characters as they arrive. `grounded` is written LAST — asked first it is a
+prediction the rest of the answer must then justify; asked last it is a retrospective verdict on an
+answer that already exists. `citations` and `escalate` sit between them.
+
+- **G0** — an unreadable envelope is retried by the existing Resilience4j policy, then escalated. It is
+  on `retry-exceptions` (a second draw at temperature 1.0 is likely to parse) and deliberately NOT on
+  the breaker's `record-exceptions`: a malformed generation says nothing about whether Anthropic is up,
+  and the classifier shares that breaker.
+- **G3** — `grounded == false` escalates and discards the answer. The discard is a backstop; clause (c)
+  already tells the model to leave the reply empty, so it exists for the model that disclaims grounding
+  and then answers anyway.
+- **G4** — citations must be non-empty and every id must be one THIS request supplied, checked against
+  what was shown rather than against `kb_chunks`: a real chunk the token budget dropped is still a
+  fabricated citation for this answer.
+
+### The escalation taxonomy grew on a new channel, not on the old one
+
+`ESCALATED_TO_HUMAN` acquired three writers with two opposite cache policies, so the diagnosis moved to
+`EscalationCause` rather than to new `ResolutionStatus` constants — that enum's `name()` is on the wire,
+and a new constant would have silently broken every integrator's `outcome` check. It is load-bearing
+twice: the cache now STORES grounding refusals (a fact about the ticket and the corpus, which the
+Decision 4 key already invalidates on re-ingest) while still refusing availability answers; and
+`EvalScorer` stops marking correct refusals DEGRADED, which would have made the entire unanswerable
+slice report 0/0 and read like a pass.
+
+### The measured result, and the number that matters more than the headline
+
+First sound `-Pevals` run (2026-08-08): 36 tickets, 0 errored, 0 rate-limit failures, both runners.
+
+| metric | before (v4, no gates) | after (v5 + G3/G4) |
+| --- | --- | --- |
+| hallucination | 4/12 (33.3%) | 0/12 (0.0%) |
+| refusal correctness | 0/4 (0.0%) | 4/4 (100.0%) |
+| over-refusal, **narrow denominator** | 0/8 (0.0%) | 0/8 (0.0%) |
+| over-refusal, **wide denominator** | 0/16 by construction † | **5/16 (31.2%)** |
+
+**The two denominators, named.**
+
+- **Narrow = 8.** The `answerable` + `trap` tickets — the grounding-classed tickets a correct run should
+  answer. This is what the harness prints.
+- **Wide = 16.** Every *scored* ticket whose golden label says `escalate: false` — every ticket that
+  should not reach a human at all. The 8 above plus `clean-03`, `clean-05`, `clean-06`, `clean-13`,
+  `out-of-scope-02`, `injection-01`, `injection-02`, `garbage-01`. (`garbage-02` also carries
+  `escalate: false` but was REJECTED by the input-contract probe and is excluded from all scores.)
+
+† The before arm ran only the 12 grounding tickets, so its wide figure was never *measured* on the other
+8. It is 0 by construction rather than by observation: the pre-Day-16 resolver has no refusal mechanism
+at all — no gates, and with k=8 the empty-context escalation never fires — so it cannot over-refuse on
+any ticket. Stated this way rather than as a measured 0/16, because those are different claims.
+
+The narrow number is the one the harness printed, and it misleads. It reads 0% because all 8 of its
+tickets are directly answerable from `kb/` — it is measured over exactly the population where
+over-refusal cannot occur. The wide number is the honest one: **the gates escalate 5 of the 16 tickets
+that should never have reached a human**, including `clean-13`, which is praise for a travel mug.
+Escalating a compliment to a support agent is not a defensible outcome. Across the whole set the gates
+escalated 21 of 35 scored tickets, 18 of them from the legacy 24.
+
+Both are quoted because either alone misleads in a different direction. Hallucination falls to zero if
+the system refuses everything; over-refusal is the price that bought it, and the narrow denominator
+hides the price.
+
+### What the traps did not measure
+
+`before=GROUNDED, after=GROUNDED` on all four gift-card tickets. The pre-Day-16 resolver already
+answered them from the corpus, so the Day 14 one-line grounding instruction was already sufficient and
+the slice could not discriminate. The traps are not evidence the gates work; they are evidence the traps
+were not hard enough — all four ask "what is the gift-card policy?", where prior and corpus differ but
+the model has no reason to blend them. None constructs the case the slice exists for: a citation that is
+structurally valid and semantically wrong.
+
+That case is real and reachable, and was confirmed against the running pipeline. A reply asserting a
+30-day window while citing the retrieved chunk that says 14 days passes G0, G3 and G4, is cached
+(`cause == NONE`), and reaches the client as `RESOLVED` with that citation and its 0.19 distance
+attached. G4 cannot catch it: it validates against `SourceRef` (`chunkId`, `breadcrumb`, `distance`),
+which carries no text, so the chunk's content is not reachable from the gate without a signature change.
+Every gate here checks the SHAPE of a claim; none checks its substance. Per-claim attribution
+(`claims[]`) is the fix, and is deliberately deferred to a widening of the schema.
+
+### The SSE path — the ruling, and that it is not yet built
+
+**The SSE path buffers until G3/G4 pass. It does not forward-then-retract.**
+
+Today's code does neither: `/resolve/stream` calls `buildStreamingParams` and opens the stream directly,
+never reaching `resolve()` where the gates live, so a streamed answer is ungated end to end. It parses
+the completed envelope once and reads only `escalate`; `grounded` and `citations` are deserialized and
+dropped.
+
+Forward-then-retract is not shippable. Retracting text a customer has already read is worse than a
+spinner, and this file already refuses to do it — `parseEnvelope`: "an error frame would contradict what
+they just watched appear." So buffering is the only defensible ruling, and its cost is total rather than
+incremental: `grounded` is verdict-LAST by design, so the verdict cannot exist until the final token,
+which means no token can be shown before generation completes. Buffering does not slow streaming down,
+it ends it — the SSE endpoint becomes the blocking endpoint with extra frames. Whether it should then
+exist at all is a product decision, not a refactor, which is why the ruling is recorded here and the
+change is not made silently.
+
+There is also a regression Day 16 introduced without opening the file. Clause (c) tells the model to
+leave `reply` EMPTY when ungrounded. On the blocking path G3 substitutes the escalation wording; on the
+streaming path nothing does, so a well-behaved model now streams an empty reply and the customer watches
+a classification frame, no text, and a done frame. Before Day 16 that ticket produced prose. The suite
+cannot see it: the extractor tests are pure state-machine tests over hand-written envelopes, and no
+integration test drives `/resolve/stream`.
+
+### What this day did not do
+
+- **The SSE ruling is documented, not implemented.** The endpoint is still ungated, and the empty-stream
+  regression above is live.
+- **The sources dimension is still quarantined.** Its note said "(Day 16)"; a deadline that passes
+  silently is how a quarantine becomes permanent, so the note now says so. Relabelling the legacy 24
+  needs a live run against the real corpus and a policy call on subset-vs-rank, neither of which
+  grounding work produced.
+- **`claims[]` does not exist**, so a citation is per-answer and cannot express "sentence 2 is not in
+  chunk 7".
+- **The harness still prints only the narrow over-refusal denominator.** The wide figure above was
+  computed by hand from the committed results file; the metric has not been widened in code.
+
+### Commands
+
+```bash
+./mvnw -B verify
+```
+
+```bash
+./mvnw -B test -Pevals
+```
