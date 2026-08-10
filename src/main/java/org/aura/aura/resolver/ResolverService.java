@@ -21,10 +21,14 @@ import lombok.extern.slf4j.Slf4j;
 import org.aura.aura.ResolverPromptProvider;
 import org.aura.aura.resilience.AnthropicTransientFailures;
 import org.aura.aura.retrieval.ContextBlock;
+import org.aura.aura.retrieval.SourceRef;
 import org.springframework.stereotype.Service;
 
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 
 @Slf4j
 @Service
@@ -112,24 +116,183 @@ public class ResolverService {
                     + stopReason.map(StopReason::asString).orElse("<absent>") + " — no usable reply");
         }
 
-        // .text() on the typed block deserializes straight into the record; the schema was enforced
-        // server-side, so a clean end_turn is guaranteed to parse.
-        ResolverOutput output = message.content().stream()
-                .flatMap(block -> block.text().stream())
-                .findFirst()
-                .map(StructuredTextBlock::text)
-                .orElseThrow(() -> new IllegalStateException("end_turn resolver response carried no text block"));
+        // GATE 0 — the structured output must be READABLE. Everything below judges an answer; this
+        // judges whether there is one to judge. See parseOrThrow.
+        ResolverOutput output = parseOrThrow(message);
+
+        return applyGroundingGates(output, context);
+    }
+
+    /**
+     * G3 and G4, over an output that has already been parsed — the ONE implementation, reachable from
+     * both transports.
+     *
+     * <h2>Why this is public, and what went wrong while it was not</h2>
+     * Day 7's rule for this pair is "ONE prompt, TWO doors", and Day 10 held it for the REQUEST by
+     * routing both transports through {@code paramsFor}. Day 16 put all of its new enforcement on the
+     * RESPONSE, and there was no equivalent seam there — so the gates were reachable only from
+     * {@link #resolve}, and {@code /resolve/stream} shipped answers no gate had ever seen. The
+     * invariant was never written down as code, so it held exactly as long as nobody added anything
+     * to the half it did not cover.
+     *
+     * <p>Extracting this is what makes the rule structural rather than remembered: a future G5 added
+     * here is a G5 both doors get, and one added inline in {@code resolve} would be a compile-time
+     * no-op for streaming rather than a silent behavioural gap.
+     *
+     * <p>Note what is deliberately NOT here: the {@code stop_reason} gate and {@link #parseOrThrow}.
+     * Those consume a {@code StructuredMessage}, which only the blocking transport has — the stream
+     * delivers its stop_reason on a {@code message_delta} frame and its payload as accumulated text.
+     * The caller is responsible for establishing that a readable {@link ResolverOutput} exists; what
+     * this method owns is judging it.
+     *
+     * @param output  a successfully parsed model output — never null
+     * @param context the block that produced the request, and therefore the only legitimate source of
+     *                citable ids
+     */
+    public Resolution applyGroundingGates(ResolverOutput output, ContextBlock context) {
+        // ── THE GROUNDING GATES ──────────────────────────────────────────────────────────────────
+        //
+        // The prompt's <grounding> contract is SOFT: it is an instruction, and an instruction is a
+        // request the model may decline, misread, or drift away from at temperature 1.0. These two
+        // gates are the HARD half. Nothing below trusts prose, and nothing below asks the model a
+        // second question — each gate compares what the model returned against something we already
+        // know independently.
+        //
+        // ORDER IS THE DESIGN, and it is cheapest-and-most-decisive first. G3 reads one boolean and
+        // can end the request; G4 only runs on answers that survived it, which means the citation
+        // check never has to reason about what an empty citation list means on an ungrounded answer.
+        // Reverse them and every G4 log line would be full of ungrounded answers that were never
+        // going to be shown.
+
+        // G3 — the model's own verdict, taken at face value in the ONE direction it is safe to.
+        // A model claiming it is grounded proves nothing (G4 checks that); a model volunteering that
+        // it is NOT is the one report it has no incentive to fake, and it is the report the contract
+        // explicitly asks for. Refusing is a correct outcome, so this is INFO, not WARN.
+        //
+        // The answer content is DISCARDED rather than shown, and that is a backstop rather than the
+        // normal case: clause (c) tells the model to leave `reply` empty here, so there is usually
+        // nothing to discard. It exists for the model that says "I am not grounded" and then answers
+        // anyway — which is precisely the failure this gate is for, and precisely the answer that
+        // must not reach a customer.
+        if (!output.grounded()) {
+            log.info("grounding gate G3 — model reported grounded=false against {} excerpt(s); "
+                            + "escalating to a human and discarding {} character(s) of answer text",
+                    context.sourcesProvided().size(), output.reply() == null ? 0 : output.reply().length());
+            return Resolution.escalatedUngrounded(EscalationCause.UNGROUNDED);
+        }
+
+        // G4 — the citations must survive being checked against the ledger.
+        Optional<List<SourceRef>> cited = validateCitations(output.citations(), context);
+        if (cited.isEmpty()) {
+            return Resolution.escalatedUngrounded(EscalationCause.UNVERIFIABLE_CITATIONS);
+        }
 
         // sourcesProvided is copied STRAIGHT off the context block — the same object whose rendered
         // bytes were sent — and never read from the model. Note what is deliberately NOT happening
         // here: no filtering by "did the reply mention this chunk", no reconciliation against the
         // model's prose. If the answer names a source, that is narration. This field is the ledger of
         // what was in the request, and a ledger that edits itself to match the story is not a ledger.
-        return new Resolution(
+        //
+        // sourcesCited is the OTHER half, and it is only allowed to exist because it has just been
+        // checked: every entry is a SourceRef looked up out of that same ledger, never a string
+        // carried over from the model. So the two lists cannot describe different chunks.
+        return Resolution.resolved(
                 output.reply(),
                 context.sourcesProvided(),
-                ResolutionStatus.RESOLVED,
+                cited.get(),
                 output.escalate());
+    }
+
+    /**
+     * GATE 0 — turn the response into a {@link ResolverOutput}, or into a retryable failure.
+     *
+     * <p>"The schema was enforced server-side, so a clean end_turn is guaranteed to parse" was true
+     * enough to write in a comment on Day 10 and is the kind of guarantee that should not be load-
+     * bearing: it depends on a provider's implementation, on the SDK's deserializer, and on the
+     * record and the schema staying in step across a refactor. When it does fail, the consequence is
+     * specific — grounding cannot be checked on an answer that cannot be read — so the failure gets a
+     * type of its own ({@link ResolverOutputUnusableException}) that is retried once by Resilience4j
+     * and then degraded to a human, rather than a bare exception that surfaces as a 500.
+     *
+     * <p>Note what stays ABOVE this method and keeps its old treatment: the {@code stop_reason} gate.
+     * A {@code max_tokens} cutoff is our own 2048-token fuse blowing and a {@code refusal} is the
+     * model declining — both are decisions someone made, not a response we failed to read, and
+     * retrying either just spends money reproducing it. They still fail loud.
+     */
+    private ResolverOutput parseOrThrow(StructuredMessage<ResolverOutput> message) {
+        StructuredTextBlock<ResolverOutput> block = message.content().stream()
+                .flatMap(content -> content.text().stream())
+                .findFirst()
+                .orElseThrow(() -> new ResolverOutputUnusableException(
+                        "end_turn resolver response carried no text block"));
+        try {
+            return block.text();
+        } catch (RuntimeException parseFailure) {
+            throw new ResolverOutputUnusableException(
+                    "end_turn resolver response did not deserialize into ResolverOutput", parseFailure);
+        }
+    }
+
+    /**
+     * GATE 4 — every cited id must name an excerpt this request actually supplied, and there must be
+     * at least one.
+     *
+     * <p><b>Membership is checked against what the model was SHOWN, not against the corpus.</b> The
+     * candidate set here is {@code context.sourcesProvided()} — the survivors that were rendered into
+     * the {@code <document>} elements — not the k=8 rows the search returned, and not kb_chunks. A
+     * real chunk id that was dropped by the token budget is still a fabricated citation for THIS
+     * answer: the model never saw its text, so it cannot have drawn a fact from it, and a check
+     * against the whole corpus would wave that through as legitimate.
+     *
+     * <p><b>Empty-with-grounded-true is a violation, not a lenient pass.</b> It is the cheapest way
+     * for a model to satisfy a grounding contract without doing any grounding — assert the verdict,
+     * skip the evidence — so treating it as "no citations offered, carry on" would leave the gate
+     * with nothing to check on exactly the answers most likely to need checking.
+     *
+     * <p>The returned list is in the LEDGER's canonical order (distance, then id), not the order the
+     * model happened to list its ids in. Two reasons: the result is cached, so a field that varies
+     * with an incidental model choice would make two identical outcomes look different to anyone
+     * diffing them; and it makes {@code sourcesCited} a genuine subsequence of {@code sourcesProvided},
+     * which is the relationship the two fields claim to have.
+     *
+     * @return the resolved subset, or {@link Optional#empty()} when the gate FAILED — the empty
+     *         Optional means "escalate", and is deliberately not the same value as a successfully
+     *         resolved empty list, which cannot occur because an empty claim is itself a violation
+     */
+    private Optional<List<SourceRef>> validateCitations(List<String> claimed, ContextBlock context) {
+        Map<String, SourceRef> provided = new LinkedHashMap<>();
+        for (SourceRef ref : context.sourcesProvided()) {
+            provided.put(ref.chunkId().toString(), ref);
+        }
+
+        if (claimed.isEmpty()) {
+            // WARN, like a foreign id and for the same reason: the model asserted a verdict it
+            // offered no evidence for. Day 24 counts these two together as "citation contract
+            // violations" and apart as two different ways of breaking it.
+            log.warn("grounding gate G4 — model reported grounded=true but cited NOTHING; escalating. "
+                            + "{} excerpt(s) were available: {}",
+                    provided.size(), provided.keySet());
+            return Optional.empty();
+        }
+
+        List<String> foreign = claimed.stream().filter(id -> !provided.containsKey(id)).toList();
+        if (!foreign.isEmpty()) {
+            // THE MODEL-MISBEHAVIOUR SIGNAL, and the offending ids are named rather than counted.
+            // A count tells an operator that something is wrong; the ids tell them WHICH kind —
+            // an "example-chunk-1" is the few-shot leaking into a real answer, a well-formed uuid
+            // that is not in the provided set is the model reaching for a chunk it saw in an earlier
+            // turn or inventing one wholesale. Those want different fixes, and the difference is
+            // invisible without the value.
+            log.warn("grounding gate G4 — model cited {} id(s) that were NOT in this request's "
+                            + "excerpts; escalating and discarding the answer. foreign={} provided={}",
+                    foreign.size(), foreign, provided.keySet());
+            return Optional.empty();
+        }
+
+        Set<String> claimedIds = Set.copyOf(claimed);   // also collapses a duplicated citation
+        return Optional.of(context.sourcesProvided().stream()
+                .filter(ref -> claimedIds.contains(ref.chunkId().toString()))
+                .toList());
     }
 
     // Circuit-breaker fallback. Two degrade paths — logged distinctly so Day 24 can count them as
@@ -179,6 +342,22 @@ public class ResolverService {
             log.warn("Claude response read timed out; escalating ticket to a human. cause={}",
                     cause.toString());
             return escalated();
+        }
+        // Day 16, GATE 0's landing point. The dependency was HEALTHY here — it answered, quickly,
+        // with a 200 — and the answer could not be read after every retry. That is a third distinct
+        // degrade cause and it gets its own log line for the same reason the two above do: Day 24
+        // counts them separately, and "how often does Claude return something we cannot parse" is a
+        // different operational question from "how often is Claude down".
+        //
+        // It is also the ONE place this method degrades on something that is not the dependency's
+        // fault, which reads like a breach of the Day 8 law until the alternative is written down.
+        // Failing loud here does not surface a bug for someone to fix — the response is gone, there
+        // is nothing to inspect — it just turns an unreadable answer into a 500. A human agent is
+        // strictly better for the customer, and the WARN is what makes it visible to us.
+        if (cause instanceof ResolverOutputUnusableException) {
+            log.warn("Claude returned an unreadable structured output and retries are exhausted; "
+                    + "escalating ticket to a human. cause={}", cause.toString());
+            return Resolution.escalatedToHuman(EscalationCause.OUTPUT_UNUSABLE);
         }
         throw cause;
     }

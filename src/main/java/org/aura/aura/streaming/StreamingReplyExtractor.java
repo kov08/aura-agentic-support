@@ -14,6 +14,24 @@ package org.aura.aura.streaming;
  * owns one and drives it from a single thread. That is what makes the whole thing unit-testable
  * without a network, which is the point.
  *
+ * <h2>Day 16: PARKED, not dead — and the difference is a decision, not a hope</h2>
+ * Nothing in production calls this today. Decision 4 buffers the SSE reply behind the grounding
+ * gates, and a buffered reply needs no incremental unescaping: {@code objectMapper.readValue} hands
+ * back the whole string correctly decoded. So the pump stopped feeding it.
+ *
+ * <p>It is kept because the reason it stopped being called is temporary and named. Phase 4's routing
+ * restores genuine streaming on the paths that owe no citations — the tickets the wide-denominator
+ * over-refusal number identified — and on those paths the model's output is still a JSON envelope,
+ * so the character-by-character problem this class solves comes back unchanged. Deleting it would
+ * mean rewriting a state machine whose hard cases (a split {@code \\uXXXX}, an escaped quote that
+ * must not terminate the string) were paid for once already and are still covered by 16 tests.
+ *
+ * <p>The honest risk of parking rather than deleting is that it rots — a schema change moves
+ * {@code reply} out of first position and nothing fails, because nothing calls this. That is
+ * precisely why {@link org.aura.aura.resolver.ResolverOutput} states the field-order constraint as a
+ * standing rule rather than as a description of current behaviour: the constraint is dormant, not
+ * repealed. If Phase 4 does not land, delete this class rather than leaving it to age.
+ *
  * <h2>What it emits</h2>
  * Only the contents of the top-level {@code "reply"} string, UNESCAPED — the customer sees a real
  * newline, never a literal backslash-n. Everything else is suppressed: leading whitespace, the

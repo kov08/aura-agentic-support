@@ -37,4 +37,44 @@ public final class KbFixtures {
                         "voyage-4-large", DocumentChunker.CHUNKER_VERSION)))
                 .getId();
     }
+
+    /**
+     * The id of {@link #seedOneGroundingChunk}'s chunk — FIXED, because a scripted model response has
+     * to name it.
+     *
+     * <p>Day 16 is why this constant exists. G4 checks every cited id against the chunks the request
+     * actually supplied, so a test that scripts a grounded answer has to know, before the request is
+     * made, which id that answer is allowed to cite. Everywhere else in the suite a chunk id is a
+     * {@code UUID.randomUUID()} nobody looks at; here it is part of the contract between the fixture
+     * and the canned response, so it is written down once and read from both ends.
+     */
+    public static final UUID GROUNDING_CHUNK_ID =
+            UUID.fromString("00000000-0000-0000-0000-00000000ca11");
+
+    /**
+     * Replaces {@code kb_chunks} with ONE excerpt at distance 0 from
+     * {@code PostgresBackedContext.queryVector()}, so any ticket retrieves it and any answer citing
+     * {@link #GROUNDING_CHUNK_ID} passes the grounding gates.
+     *
+     * <p>Shared by the transport ITs, which are about the wire and not about retrieval, and which
+     * before Day 16 could leave the corpus empty because nothing checked whether an answer had
+     * anything to stand on. It is not free to leave empty any more: an empty corpus means no citable
+     * id, which means every scripted "success" response would escalate at G4 and every transport
+     * assertion would be reading the wrong outcome for the wrong reason.
+     *
+     * <p>Callers must clear the corpus in an {@code @AfterAll} — the Postgres container is shared, so
+     * rows written here outlive the class that wrote them.
+     */
+    public static void seedOneGroundingChunk(ChunkRepository chunks, DocumentRepository documents) {
+        chunks.deleteAllInBatch();
+        float[] vector = new float[KbChunk.EMBEDDING_DIMENSION];
+        vector[0] = 1.0f;
+        chunks.save(new KbChunk(
+                GROUNDING_CHUNK_ID,
+                documentId(documents, "refund-policy.md"),
+                "refund-policy.md", 0,
+                "Refund Policy > Standard Refund Window",
+                "Customers have 30 days from the delivery date to request a refund.",
+                100, vector, "voyage-4-large"));
+    }
 }

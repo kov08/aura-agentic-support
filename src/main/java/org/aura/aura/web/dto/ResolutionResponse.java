@@ -23,6 +23,29 @@ public record ResolutionResponse(
         // Still a trust signal, and now a checkable one: an empty list on a confident answer is a
         // smell, and a populated list whose distances are all poor is the same smell with evidence.
         List<SourceResponse> sourcesProvided,
+        // Day 16: the OTHER half of the grounding story, and the half a client has actually been
+        // asking for since Day 14.
+        //
+        // sourcesProvided answers "what was the model shown?". It is a complete and honest answer
+        // and it is not the question a support engineer reading a response has: they want to know
+        // which of those four documents this sentence came from. Until today nothing could say —
+        // "used" was explicitly renamed away in Day 14 precisely because nobody was in a position
+        // to claim it.
+        //
+        // What makes it claimable now is that it is CHECKED. Every entry here is a SourceRef looked
+        // up out of the ledger by an id the model supplied and G4 verified was really in the request;
+        // an answer whose citations failed that check never became a RESOLVED response at all. So
+        // this list is a subset of sourcesProvided by construction, in the same canonical order, and
+        // the pair reads as a claim next to its evidence rather than a claim on its own.
+        //
+        // ADDITIVE, unlike the Day 14 rename: sourcesProvided keeps its meaning exactly, so nothing
+        // an integrator already parses changes underneath them.
+        //
+        // EMPTY ON EVERY ESCALATION, and structurally rather than by a check in the mapper below:
+        // Resolution's escalation factories build both lists empty, because those replies were
+        // produced INSTEAD of an answer and attaching a grounding receipt to one would be claiming
+        // evidence for text no document produced.
+        List<SourceResponse> sourcesCited,
         // Day 6: the classification that preceded this resolution rides along in the
         // response. Today it's informational (and the routing hook for Day 7+); exposing
         // it now means clients integrate against the final shape once, not twice.
@@ -49,6 +72,14 @@ public record ResolutionResponse(
                 // that trimmed or re-sorted it here would make the wire disagree with the bytes the
                 // model saw — the one thing the ledger exists to guarantee it does not do.
                 resolution.sourcesProvided().stream().map(SourceResponse::from).toList(),
+                // Same discipline, and the same record type. A two-field {chunkId, breadcrumb} twin
+                // of SourceResponse was the obvious alternative and is worse: the entries here are
+                // the SAME SourceRef objects as the ones above, so dropping the distance would mean
+                // publishing one document as "0.19 away" in one field and as an unqualified fact in
+                // the other. Distance is what lets a reader tell a grounded answer from a decorated
+                // one (see SourceResponse), and it is most worth having on the list that claims the
+                // answer leaned on it.
+                resolution.sourcesCited().stream().map(SourceResponse::from).toList(),
                 classification
         );
     }

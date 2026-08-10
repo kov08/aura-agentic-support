@@ -1,0 +1,52 @@
+# EVAL-only environment: real APIs, on a rate-limited account. The mirror image of application-it.yml
+# — that profile SHORTENS waits because its transport is a local fake; this one LENGTHENS them because
+# its transport is a real provider with a per-minute quota.
+#
+# Property KEYS are identical to prod/test, which is the same drift guard the `it` profile relies on:
+# an eval run drives the exact properties production reads, only more patiently. Activated by the eval
+# runners via @ActiveProfiles({"test","evals"}); `evals` is listed last, so these values win.
+#
+# WHY THIS EXISTS — measured, 2026-08-08, on a free-tier Voyage account:
+#   A first `-Pevals` run produced 88 x HTTP 429 and was thrown away. The damage was in two places and
+#   the second one is the interesting one:
+#     - 87 on the QUERY lane (voyage-4-lite), erroring 29 of 36 tickets; and
+#     - 1 on the DOCUMENT lane (voyage-4-large) during the corpus ingest that runs at context startup,
+#       which failed warranty-policy.md and left the eval scoring a corpus missing 10 chunks.
+#   The second is why pacing inside the runner loop would not have been enough: the ingest happens
+#   before the first ticket, inside IngestionPipeline, where no test code is running yet. @Retry(name =
+#   "voyage") is on embedBatched AND embedQuery, so it is the one lever that reaches both.
+#
+# WHY WAITING RATHER THAN THROTTLING. A client-side pacer is the better engineering answer and would
+# have meant widening VoyageProperties — a production knob added for a test's benefit, plus nine
+# construction sites in tests to update. Retry-with-patience needs no new code and no new concept: the
+# request bursts, gets a 429, and waits out the window. It is slightly wasteful (a rejected request is
+# still a request) and it is honest about what it is — a way to run a 58-call harness against a 3-per-
+# minute quota, not a production strategy.
+#
+# WHAT THIS COSTS: roughly 3 embeddings per minute, so a full run (36 golden tickets + 12 grounding
+# tickets x 2 arms, plus two corpus ingests) takes tens of minutes of mostly waiting. That is the
+# intended trade — a slow correct measurement beats a fast invalid one, which is exactly what the
+# discarded run was.
+resilience4j:
+  retry:
+    instances:
+      voyage:
+        # 10, not the production 3. At ~3 requests/minute a burst of tickets can sit behind several
+        # closed windows in a row, and 3 attempts spanning ~1.5s of backoff exhausts long before the
+        # first one reopens — which is precisely how the discarded run turned a rate limit into 29
+        # "ERRORED" tickets and a failed build.
+        max-attempts: 10
+        # FIXED 21s, just over a 20-second slot at 3/min. Deliberately NOT exponential: doubling from
+        # 21s reaches five minutes by the fourth attempt and eleven by the fifth, so a run that hit a
+        # couple of limits early would spend its time asleep rather than measuring. The quota window
+        # is fixed-width, so a fixed wait is the shape that matches it.
+        wait-duration: 21s
+        enable-exponential-backoff: false
+        # Jitter ON, and this one is not inherited thoughtlessly from prod. Every attempt here queues
+        # behind the same quota window, so identical waits would make the retries arrive in a
+        # synchronised clump at the instant it reopens and re-trip it together. Spreading them is
+        # exactly the case randomized wait exists for.
+        enable-randomized-wait: true
+        # retry-exceptions are INHERITED from application.yml (VoyageTransientException only). The
+        # retry BUDGET is what changes here; WHICH failures are retryable is a correctness decision
+        # and is held fixed, so a 401 still fails fast instead of being slept on ten times.

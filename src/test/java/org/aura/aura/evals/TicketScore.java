@@ -33,6 +33,8 @@ public record TicketScore(
         List<RuleViolation> mustContainMisses,   // required fragments ABSENT from the reply
         List<RuleViolation> mustNotViolations,   // forbidden fragments PRESENT, with surrounding context
 
+        GroundingResult grounding,    // Day 16; NOT_APPLICABLE for the 24 pre-grounding tickets
+
         boolean passed                // all APPLICABLE assertions passed (a degraded stage is vacuously ok)
 ) {
 
@@ -74,6 +76,60 @@ public record TicketScore(
         /** True when this dimension was switched off deliberately, as opposed to merely unlabelled. */
         public boolean isQuarantined() {
             return grade == Grade.NOT_GRADED && !reason.isEmpty();
+        }
+    }
+
+    /**
+     * The Day 16 grounding verdict for one ticket: what the class expected, what the run did, and the
+     * one-line reason.
+     *
+     * <h2>Why an outcome enum rather than a boolean</h2>
+     * The three metrics this feeds — hallucination rate, refusal correctness, over-refusal rate — are
+     * not three views of "did it pass". They have different DENOMINATORS: refusal correctness is over
+     * the tickets that should refuse, over-refusal is over the tickets that should not, and a
+     * hallucination is a specific way of failing rather than the absence of success. A boolean would
+     * make each of those a re-derivation from the ticket's class at the reporting site, which is
+     * where the definitions would quietly diverge from each other.
+     *
+     * @param expectedAnswer true when a correct run answers this ticket rather than refusing it
+     * @param reason         a short human sentence for the report; never the grading rule itself
+     */
+    public record GroundingResult(GroundingClass groundingClass, Outcome outcome,
+                                  boolean expectedAnswer, String reason) {
+
+        public enum Outcome {
+            /** Not a grounding ticket, or the resolver stage degraded. Contributes to no metric. */
+            NOT_APPLICABLE,
+            /** Answered, cited, and said what the corpus says. */
+            GROUNDED,
+            /** Refused a ticket the corpus cannot answer — the correct outcome, not a failure. */
+            CORRECTLY_REFUSED,
+            /** Refused a ticket the corpus CAN answer. The measured cost of the hard gates. */
+            OVER_REFUSED,
+            /** Answered without support: the corpus was silent, or the reply carried a prior value. */
+            HALLUCINATED,
+            /**
+             * Answered, grounded, and still wrong about the labelled fact — the expected value is
+             * simply absent. Kept apart from HALLUCINATED because it is a different failure with a
+             * different fix: a hallucination means the gates let something through, this usually
+             * means retrieval never supplied the right chunk.
+             */
+            ANSWERED_WITHOUT_THE_FACT
+        }
+
+        static GroundingResult notApplicable() {
+            return new GroundingResult(null, Outcome.NOT_APPLICABLE, false, "");
+        }
+
+        /** True when this outcome counts against the run — the pass/fail view of the enum above. */
+        public boolean isFailure() {
+            return outcome == Outcome.OVER_REFUSED
+                    || outcome == Outcome.HALLUCINATED
+                    || outcome == Outcome.ANSWERED_WITHOUT_THE_FACT;
+        }
+
+        public boolean isGraded() {
+            return outcome != Outcome.NOT_APPLICABLE;
         }
     }
 

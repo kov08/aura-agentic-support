@@ -29,7 +29,12 @@ class StreamingReplyExtractorTest {
     private static final String JSON =
             "{\"reply\":\"Line one." + BS + "n"
             + "He said " + BS + "\"hi" + BS + "\" about {braces} and 50%" + BS + BS + " caf" + BS + "u00e9.\","
-            + "\"escalate\":true}";
+            // Day 16: the envelope carries four fields now, and this fixture carries all four for a
+            // reason that is not tidiness. `grounded` is a PRIMITIVE boolean, so an envelope missing
+            // it does not quietly default to false — Jackson refuses the whole object. A fixture
+            // still shaped like Day 10's two-field envelope would therefore test a parse that can
+            // never happen in production, and would keep passing while the real one broke.
+            + "\"citations\":[\"chunk-a\",\"chunk-b\"],\"escalate\":true,\"grounded\":true}";
 
     private static final String EXPECTED_REPLY =
             "Line one.\nHe said \"hi\" about {braces} and 50%\\ café.";
@@ -175,6 +180,8 @@ class StreamingReplyExtractorTest {
 
         assertThat(output.escalate()).isTrue();
         assertThat(output.reply()).isEqualTo(EXPECTED_REPLY);
+        assertThat(output.citations()).containsExactly("chunk-a", "chunk-b");
+        assertThat(output.grounded()).isTrue();
     }
 
     @Test
@@ -182,9 +189,35 @@ class StreamingReplyExtractorTest {
         ObjectMapper mapper = JsonMapper.builder().build();
 
         ResolverOutput output = mapper.readValue(
-                "{\"reply\":\"All set — your order ships tomorrow.\",\"escalate\":false}", ResolverOutput.class);
+                "{\"reply\":\"All set — your order ships tomorrow.\",\"citations\":[\"chunk-a\"],"
+                        + "\"escalate\":false,\"grounded\":true}", ResolverOutput.class);
 
         assertThat(output.escalate()).isFalse();
         assertThat(output.reply()).isEqualTo("All set — your order ships tomorrow.");
+    }
+
+    /**
+     * The extractor is DONE at the reply's closing quote, so the two fields Day 16 added stream past
+     * it and are suppressed like {@code escalate} always was. Worth an assertion rather than an
+     * assumption: {@code citations} is the first ARRAY the envelope has ever carried, and its
+     * elements are quoted strings — the one character class the state machine treats as structural.
+     * A regression that let the machine re-enter IN_STRING on a citation id would paint chunk ids
+     * across the customer's screen.
+     */
+    @Test
+    void citationsAndGroundedNeverReachTheCustomer() {
+        String envelope = "{\"reply\":\"Blue, in one size.\","
+                + "\"citations\":[\"example-chunk-1\",\"example-chunk-2\"],"
+                + "\"escalate\":false,\"grounded\":true}";
+
+        assertThat(feedAll(envelope)).isEqualTo("Blue, in one size.");
+    }
+
+    /** The same, split so a chunk boundary falls inside a citation id. */
+    @Test
+    void citationsAreSuppressedEvenWhenAChunkBoundarySplitsAnId() {
+        assertThat(feedAll("{\"reply\":\"Blue.\",\"citations\":[\"example-ch",
+                "unk-1\"],\"escalate\":false,\"grounded\":true}"))
+                .isEqualTo("Blue.");
     }
 }

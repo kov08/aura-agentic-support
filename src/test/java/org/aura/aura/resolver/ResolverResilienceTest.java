@@ -186,14 +186,75 @@ class ResolverResilienceTest {
         verify(client.messages(), never()).create(any(StructuredMessageCreateParams.class));
     }
 
-    // A well-formed Day 10 envelope. The block is a real SDK object wrapping real JSON rather than a
-    // mock, so the typed deserialization the service depends on actually runs in these tests.
+    /**
+     * GATE 0, end to end through the live proxy: an unreadable structured output is RETRIED like a
+     * transient, and only escalates once the budget is spent.
+     *
+     * <p>This is the assertion the gate-0 policy actually rests on, and it cannot be made in a unit
+     * test: {@code retry-exceptions} is a list of class names in {@code application.yml} matched
+     * reflectively by Resilience4j at runtime, so a typo there compiles, passes every mocked test,
+     * and silently converts "retry twice then hand to a human" into "escalate on the first malformed
+     * token". The COUNT is what proves the list entry resolves.
+     *
+     * <p>Three attempts and not one is the whole point: the call is a pure read at temperature 1.0,
+     * so a second sample is a genuinely different draw, and most unreadable outputs are a one-off.
+     * Escalating immediately would hand a person a ticket the model could have answered on the next
+     * try.
+     */
+    @Test
+    void anUnreadableStructuredOutputIsRetriedAndThenEscalates() {
+        // Built BEFORE the outer stubbing starts. unreadableResponse() stubs a mock of its own, and
+        // Mockito treats a nested when(...) inside an unfinished when(...) as UnfinishedStubbing —
+        // which surfaces as a failure in whichever test runs next, not this one.
+        StructuredMessage<ResolverOutput> first = unreadableResponse();
+        StructuredMessage<ResolverOutput> second = unreadableResponse();
+        StructuredMessage<ResolverOutput> third = unreadableResponse();
+        when(client.messages().create(any(StructuredMessageCreateParams.class)))
+                .thenReturn(first)
+                .thenReturn(second)
+                .thenReturn(third);
+
+        Resolution resolution = resolver.resolve(TICKET, CONTEXT);
+
+        assertThat(resolution.status()).isEqualTo(ResolutionStatus.ESCALATED_TO_HUMAN);
+        // OUTPUT_UNUSABLE, not DEPENDENCY_UNAVAILABLE. The dependency was healthy throughout — it
+        // answered three times, quickly — and the cause is what keeps the cache from storing this
+        // (a bad generation is a property of one call) and what lets Day 24 count it separately from
+        // an outage.
+        assertThat(resolution.escalationCause()).isEqualTo(EscalationCause.OUTPUT_UNUSABLE);
+        assertThat(resolution.escalate()).isTrue();
+        verify(client.messages(), times(3)).create(any(StructuredMessageCreateParams.class));
+    }
+
+    /** A clean end_turn whose payload is not a ResolverOutput — the gate-0 case. */
+    @SuppressWarnings("unchecked")
+    private static StructuredMessage<ResolverOutput> unreadableResponse() {
+        StructuredMessage<ResolverOutput> message = mock(StructuredMessage.class);
+        when(message.stopReason()).thenReturn(Optional.of(StopReason.END_TURN));
+        TextBlock textBlock = TextBlock.builder()
+                .text("{\"reply\": \"cut off mid-")
+                .citations(List.of())
+                .build();
+        when(message.content()).thenReturn(List.of(
+                new StructuredContentBlock<>(ResolverOutput.class, ContentBlock.ofText(textBlock))));
+        return message;
+    }
+
+    // A well-formed envelope, Day 16 shape: grounded, and citing the one chunk CONTEXT supplies. It
+    // has to cite a REAL id from that fixture rather than a placeholder — G4 checks every id against
+    // the chunks the request actually carried, so a made-up id here would turn every resilience test
+    // into a grounding escalation and the retry/breaker assertions would be measuring the wrong gate.
+    //
+    // The block is a real SDK object wrapping real JSON rather than a mock, so the typed
+    // deserialization the service depends on actually runs in these tests.
     @SuppressWarnings("unchecked")
     private static StructuredMessage<ResolverOutput> okResponse() {
         StructuredMessage<ResolverOutput> message = mock(StructuredMessage.class);
         when(message.stopReason()).thenReturn(Optional.of(StopReason.END_TURN));
         TextBlock textBlock = TextBlock.builder()
-                .text("{\"reply\":\"Returns are accepted within 30 days.\",\"escalate\":false}")
+                .text("{\"reply\":\"Returns are accepted within 30 days.\",\"citations\":[\""
+                        + CONTEXT.sourcesProvided().getFirst().chunkId()
+                        + "\"],\"escalate\":false,\"grounded\":true}")
                 .citations(List.of())
                 .build();
         when(message.content()).thenReturn(List.of(

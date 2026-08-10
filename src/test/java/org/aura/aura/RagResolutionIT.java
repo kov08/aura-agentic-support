@@ -12,6 +12,7 @@ import com.anthropic.models.messages.TextBlockParam;
 import com.redis.testcontainers.RedisContainer;
 import org.aura.aura.client.VoyageEmbeddingClient;
 import org.aura.aura.resolver.CachedResolutionService;
+import org.aura.aura.resolver.EscalationCause;
 import org.aura.aura.resolver.Resolution;
 import org.aura.aura.resolver.ResolutionStatus;
 import org.aura.aura.resolver.ResolverOutput;
@@ -105,25 +106,69 @@ class RagResolutionIT extends PostgresBackedContext {
         documents.deleteAllInBatch();
     }
 
+    /**
+     * FIXED chunk ids, and Day 16 is what forced them to be.
+     *
+     * <p>Until the grounding gates landed, a chunk's uuid was something only the ledger looked at and
+     * {@code UUID.randomUUID()} was fine. Now a scripted answer has to CITE one, and G4 checks the
+     * citation against the ids the request actually carried — so the id has to be knowable before the
+     * request is made. Written down rather than captured after the save, so the canned response and
+     * the fixture read as one contract instead of one deriving itself from the other.
+     */
+    private static final UUID REFUND_0 = UUID.fromString("00000000-0000-0000-0000-0000000000d1");
+    private static final UUID REFUND_1 = UUID.fromString("00000000-0000-0000-0000-0000000000d2");
+    private static final UUID SHIPPING_0 = UUID.fromString("00000000-0000-0000-0000-0000000000d3");
+    private static final UUID WARRANTY_0 = UUID.fromString("00000000-0000-0000-0000-0000000000d4");
+
+    /**
+     * FLUSH REDIS BETWEEN METHODS, explicitly — and the story of why this line had to be added is
+     * worth more than the line.
+     *
+     * <p>Every method in this class resolves the SAME ticket against the SAME corpus, so they all
+     * compute the same cache key and the second one onward would be served from the first one's
+     * entry. That was already true before Day 16 and the class passed anyway, for a reason nobody
+     * chose: the fixture used {@code UUID.randomUUID()} for chunk ids, those ids are rendered into
+     * the {@code <document id="...">} attributes, and the rendered block is hashed into the key
+     * (Decision 4) — so every method silently got its own keyspace.
+     *
+     * <p>Day 16 needed the ids to be FIXED, because a scripted answer now has to cite one and G4
+     * checks it. That removed the accidental isolation, and four methods failed at once: two saw
+     * "zero interactions with the Anthropic mock", one saw a RESOLVED where the scripted response
+     * said grounded=false. Every one of those was a cache hit from the previous method.
+     *
+     * <p>So the isolation is now DECLARED rather than inherited from a random number. It is the
+     * better arrangement regardless: an isolation property that holds because ids happen to be random
+     * is one that disappears the moment anyone needs a deterministic id, which is exactly what
+     * happened. Note the class also keeps its own Redis container ({@code @Container} above) for the
+     * same reason at a coarser grain — that stops a PREVIOUS RUN leaking in; this stops the previous
+     * METHOD doing it.
+     */
+    @BeforeEach
+    void clearResponseCache() {
+        redis.getConnectionFactory().getConnection().serverCommands().flushDb();
+    }
+
+    @Autowired org.springframework.data.redis.core.StringRedisTemplate redis;
+
     @BeforeEach
     void seedCorpusAndStubs() {
         chunks.deleteAllInBatch();
         chunks.saveAll(List.of(
                 // d = 0.0     — the answer
-                chunk("refund-policy.md", 0, "Refund Policy > Standard Refund Window",
+                chunk(REFUND_0, "refund-policy.md", 0, "Refund Policy > Standard Refund Window",
                         "Customers have 30 days from the delivery date to request a refund.", unit(0)),
                 // d ≈ 0.2929  — refund#0's NEIGHBOUR: ranks second, and is dropped by adjacency dedup
-                chunk("refund-policy.md", 1, "Refund Policy > How To Start A Return",
+                chunk(REFUND_1, "refund-policy.md", 1, "Refund Policy > How To Start A Return",
                         "Start a return from your order history and print the prepaid label.", diagonal(2)),
                 // d ≈ 0.4226  — a distinct document, and the chunk that inherits the freed budget
-                chunk("shipping-policy.md", 0, "Shipping Policy > Delivery Speeds",
+                chunk(SHIPPING_0, "shipping-policy.md", 0, "Shipping Policy > Delivery Speeds",
                         "Standard delivery is 3-5 business days and free over 35 USD.", diagonal(3)),
                 // d = 1.0     — ranks last and does not fit; the budget stops before it
-                chunk("warranty-policy.md", 0, "Warranty Policy > Coverage Period",
+                chunk(WARRANTY_0, "warranty-policy.md", 0, "Warranty Policy > Coverage Period",
                         "Every product carries a 12-month limited warranty.", unit(1))));
 
         when(voyage.embedQuery(anyString())).thenReturn(QUERY_VECTOR);
-        stubClaude("{\"reply\":\"You're within the 30-day window.\",\"escalate\":false}");
+        stubClaude("You're within the 30-day window.", REFUND_0);
     }
 
     // ---------------------------------------------------------------- retrieval reaches the wire
@@ -169,7 +214,15 @@ class RagResolutionIT extends PostgresBackedContext {
         assertThat(system).hasSize(1);
         assertThat(system.getFirst().cacheControl()).isPresent();
         assertThat(system.getFirst().text()).contains("Answer only from the provided documents");
-        assertThat(system.getFirst().text()).doesNotContain("<documents>");
+        // The assertion is "no RETRIEVED byte reached the prefix", and as of Day 16 it has to be
+        // written that way rather than as doesNotContain("<documents>"): the prompt's few-shot
+        // examples now show a real <documents> block, because a few-shot that teaches citations has
+        // to show the ids being cited. Testing for the literal tag would now fail on the prompt's own
+        // (invented, ExampleCo) content while a genuine leak of THIS request's corpus went unnoticed —
+        // which is the assertion inverted. The chunk text is what must never be in the cached prefix.
+        assertThat(system.getFirst().text())
+                .doesNotContain("Customers have 30 days from the delivery date")
+                .doesNotContain("Standard delivery is 3-5 business days");
 
         // AFTER the breakpoint: the documents, then the ticket.
         String userTurn = sent.messages().getFirst().content().asString();
@@ -215,7 +268,7 @@ class RagResolutionIT extends PostgresBackedContext {
         jdbc.update("UPDATE kb_chunks SET content = ? WHERE source_doc = ? AND chunk_index = ?",
                 "Customers have 45 days from the delivery date to request a refund.",
                 "refund-policy.md", 0);
-        stubClaude("{\"reply\":\"You're within the 45-day window.\",\"escalate\":false}");
+        stubClaude("You're within the 45-day window.", REFUND_0);
 
         Resolution afterEdit = resolutions.resolve(new ResolveTicketRequest(TICKET));
 
@@ -224,6 +277,50 @@ class RagResolutionIT extends PostgresBackedContext {
                 .isEqualTo("You're within the 45-day window.");
         verify(anthropic.messages(), times(2)).create(any(StructuredMessageCreateParams.class));
     }
+
+    // ---------------------------------------------------------------- Day 16: grounding + the cache
+
+    /**
+     * WORK ITEM 5 end to end: a grounding refusal is stored, and a repeat of the same ticket is
+     * served from Redis without paying Sonnet again.
+     *
+     * <p>Unit tests pin the policy against a mocked cache; this pins it against a real one, through
+     * the real key. The distinction it rests on is invisible to {@code status} — both this and an
+     * Anthropic outage are ESCALATED_TO_HUMAN — so if the cache gate ever slipped back to keying on
+     * status, every refusal would silently cost a full model call forever and nothing would fail.
+     */
+    @Test
+    void aGroundingRefusalIsServedFromCacheOnTheSecondIdenticalTicket() {
+        stubClaudeRaw("{\"reply\":\"\",\"citations\":[],\"escalate\":true,\"grounded\":false}");
+
+        Resolution first = resolutions.resolve(new ResolveTicketRequest(TICKET));
+        Resolution second = resolutions.resolve(new ResolveTicketRequest(TICKET));
+
+        assertThat(first.status()).isEqualTo(ResolutionStatus.ESCALATED_TO_HUMAN);
+        assertThat(second.status()).isEqualTo(ESCALATED);
+        assertThat(second.escalationCause()).isEqualTo(EscalationCause.UNGROUNDED);
+        assertThat(second.answer()).isEqualTo(first.answer());
+        // ONE model call for two tickets. "The knowledge base does not answer this" is a fact about
+        // the corpus, not about this minute, and the Decision 4 key is what makes storing it safe:
+        // re-ingesting a document that covers the question changes what this ticket retrieves, which
+        // changes the key, which orphans the entry.
+        verify(anthropic.messages(), times(1)).create(any(StructuredMessageCreateParams.class));
+    }
+
+    /** An availability escalation is the opposite policy, and it must stay that way. */
+    @Test
+    void anUnreadableOutputEscalationIsNotServedFromCache() {
+        stubClaudeRaw("{\"reply\": \"truncated mid-");
+
+        resolutions.resolve(new ResolveTicketRequest(TICKET));
+        resolutions.resolve(new ResolveTicketRequest(TICKET));
+
+        // Three attempts per request (the gate-0 retry budget), twice: nothing was stored, so the
+        // second ticket re-ran the whole thing rather than inheriting one bad generation for a day.
+        verify(anthropic.messages(), times(6)).create(any(StructuredMessageCreateParams.class));
+    }
+
+    private static final ResolutionStatus ESCALATED = ResolutionStatus.ESCALATED_TO_HUMAN;
 
     // ---------------------------------------------------------------- fixtures
 
@@ -235,8 +332,17 @@ class RagResolutionIT extends PostgresBackedContext {
         return captor.getValue();
     }
 
+    /** A grounded Day 16 envelope citing {@code cited} — the ids must be ones retrieval supplied. */
+    private void stubClaude(String reply, UUID... cited) {
+        String ids = java.util.Arrays.stream(cited)
+                .map(id -> "\"" + id + "\"")
+                .collect(java.util.stream.Collectors.joining(",", "[", "]"));
+        stubClaudeRaw("{\"reply\":\"" + reply + "\",\"citations\":" + ids
+                + ",\"escalate\":false,\"grounded\":true}");
+    }
+
     @SuppressWarnings("unchecked")
-    private void stubClaude(String envelopeJson) {
+    private void stubClaudeRaw(String envelopeJson) {
         StructuredMessage<ResolverOutput> message = mock(StructuredMessage.class);
         when(message.stopReason()).thenReturn(java.util.Optional.of(StopReason.END_TURN));
         // A real SDK block wrapping real JSON, so the typed deserialization path runs rather than
@@ -252,11 +358,11 @@ class RagResolutionIT extends PostgresBackedContext {
      * uniform so the packing outcome is decided by the ranking and the dedup rule rather than by an
      * accident of chunk sizes.
      */
-    private KbChunk chunk(String doc, int index, String breadcrumb, String content, float[] vector) {
+    private KbChunk chunk(UUID id, String doc, int index, String breadcrumb, String content, float[] vector) {
         // Day 15: kb_chunks.document_id is a NOT NULL foreign key, so the parent row has to exist and
         // be flushed before this chunk can be inserted. Non-static now for exactly that reason — it
         // needs the repository.
-        return new KbChunk(UUID.randomUUID(), KbFixtures.documentId(documents, doc), doc, index,
+        return new KbChunk(id, KbFixtures.documentId(documents, doc), doc, index,
                 breadcrumb, content, 300, vector, "voyage-4-large");
     }
 

@@ -44,9 +44,26 @@ ordered:
 
 - Perishable goods, including food and fresh flowers
 - Personalised or custom-manufactured items, including engraved products
-- Digital downloads and gift cards once the code has been revealed
+- Digital downloads once the file has been accessed
 - Opened hygiene products such as earbuds, razors, and cosmetics
 - Items marked "Final Sale" on the product page at the time of purchase
+
+Gift cards are NOT on this list. They have their own, shorter window — see the next section.
+
+### Gift Cards
+
+**ShopFast gift cards are refundable within 7 days of purchase**, and the refund is available even
+after the code has been revealed. The 7 days run from the purchase date, not the delivery date, and
+this is the one product category where revealing the code does not end the refund right.
+
+The card must be unspent. A partially redeemed card cannot be refunded at all — not for the unspent
+balance, and not for the difference. Where a card was bought as a gift, only the purchaser can
+request the refund, because the money goes back to the card that paid for it.
+
+Gift cards are deliberately outside the standard 30-day window in both directions: shorter, because
+an unspent code is trivially resold and a month is long enough for that to become a fraud channel,
+and refundable-after-reveal, because a revealed code is not a used one and treating the two as the
+same thing generated more disputes than it prevented.
 
 ## How to Start a Refund
 

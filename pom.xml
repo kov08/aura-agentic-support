@@ -360,8 +360,17 @@
                                  of them — so without this include, <groups>eval</groups> filters an
                                  empty candidate set and 0 tests run (observed). This include makes
                                  EvalRunner a candidate; the eval tag then selects it. -->
+                            <!-- A PATTERN, not a list of names, since Day 16. The list version held
+                                 exactly EvalRunner, so GroundingBeforeAfterRunner was added, tagged
+                                 "eval", and silently never ran: it matched no default Surefire pattern
+                                 AND was not named here, so it was filtered out of the candidate set
+                                 before the tag was ever consulted. Nothing failed — `-Pevals` reported
+                                 "Tests run: 1" and a green-looking single runner.
+                                 A name pattern makes the next runner a candidate by existing, which is
+                                 the failure mode this include was introduced to prevent in the first
+                                 place, one level up. -->
                             <includes>
-                                <include>**/evals/EvalRunner.java</include>
+                                <include>**/evals/*Runner.java</include>
                             </includes>
                         </configuration>
                     </plugin>
