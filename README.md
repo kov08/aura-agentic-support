@@ -1227,38 +1227,183 @@ Two mechanical traps, both of which would have silently disabled the guard:
 
 ## Day 16 — Grounding: a contract, two hard gates, and the bill they came with
 
-The resolver was handed retrieved context on Day 14 and nothing made it obey. The prompt asked; an
-instruction is a request a model may decline. Today adds a contract it can read and two gates it
-cannot argue with — and, because those gates are structural rather than semantic, a measured account
-of what they do and do not buy.
+Day 14 put retrieved context in front of the model and Day 15 made the corpus maintainable. Neither
+made the model OBEY the context. The prompt asked it to — and an instruction is a request a model may
+decline, misread, or drift away from at temperature 1.0. Today adds a contract it can read and gates
+it cannot argue with.
 
-`ResolverOutput` widens to four fields, pinned from both ends. `reply` stays FIRST because the SSE
-extractor forwards its characters as they arrive. `grounded` is written LAST — asked first it is a
-prediction the rest of the answer must then justify; asked last it is a retrospective verdict on an
-answer that already exists. `citations` and `escalate` sit between them.
+The gates turned out to be the easy half. The hard half was measuring them honestly, and most of what
+follows is about the ways the measurement wanted to flatter itself.
 
-- **G0** — an unreadable envelope is retried by the existing Resilience4j policy, then escalated. It is
-  on `retry-exceptions` (a second draw at temperature 1.0 is likely to parse) and deliberately NOT on
-  the breaker's `record-exceptions`: a malformed generation says nothing about whether Anthropic is up,
-  and the classifier shares that breaker.
-- **G3** — `grounded == false` escalates and discards the answer. The discard is a backstop; clause (c)
-  already tells the model to leave the reply empty, so it exists for the model that disclaims grounding
-  and then answers anyway.
-- **G4** — citations must be non-empty and every id must be one THIS request supplied, checked against
-  what was shown rather than against `kb_chunks`: a real chunk the token budget dropped is still a
-  fabricated citation for this answer.
+### The schema is pinned from both ends
+
+`ResolverOutput` widens from two fields to four, and the order is the design:
+
+```
+reply        FIRST  — the SSE extractor forwards its characters as they arrive
+citations           — the ids this answer drew facts from
+escalate            — the business verdict
+grounded     LAST   — a retrospective judgement on everything above
+```
+
+Both ends are load-bearing and they pull in opposite directions. `reply` must stay first or the
+streaming path's first visible character is delayed by however long another field takes to emit — and
+`StreamingReplyExtractor` relies on nothing preceding it, so the first `"reply"` token in the document
+is always the real key rather than a substring of some earlier value.
+
+`grounded` must stay last because generation is autoregressive. Asked FIRST, "are you grounded?" is a
+prediction the rest of the answer then has to live up to, and the model will write an answer that
+justifies the verdict it already committed to. Asked LAST it is a retrospective self-assessment: the
+answer and the citations are already on the page, and the verdict judges them. Same field, same
+schema, completely different question.
+
+`citations` is model-written, which the class javadoc has forbidden for `sourcesProvided` since Day 14.
+The difference is that nothing verified `sourcesProvided` if the model wrote it, whereas every citation
+id is checked against the chunk set actually put in front of the model. A self-reported field is only
+dangerous when nothing checks it; checked against a deterministic record, it becomes evidence.
+
+The schema WIDENS and is never rewritten. A future `claims[]` — per-sentence attribution rather than
+per-answer — is an addition after `escalate`, not a redefinition of `citations`. That constraint exists
+because every field here is also prompt: the `@JsonPropertyDescription` texts travel into the schema
+the model reads, so redefining one silently changes behaviour while the field name in the code stays
+put.
+
+### Three gates, and what each one actually checks
+
+The prompt's `<grounding>` block is the SOFT half — three clauses: answer only from the excerpts, cite
+every excerpt used, and refuse when they do not contain the answer. The gates are the hard half. None
+of them asks the model a second question; each compares what it returned against something already
+known.
+
+- **G0 — the output must be readable.** A payload that will not deserialize gets its own exception type,
+  because it fits nothing already there: the dependency answered, promptly and with a 200, and what it
+  said was unusable. It is on `retry-exceptions` (the call is a pure read at temperature 1.0, so a
+  second draw is genuinely likely to parse) and deliberately NOT on the breaker's `record-exceptions` —
+  a run of malformed generations says nothing about whether Anthropic is up, and recording them would
+  let a bad prompt edit trip a breaker the classifier shares. Once retries are spent it escalates:
+  grounding cannot be checked on an answer that cannot be read.
+- **G3 — `grounded == false` escalates**, and the answer is discarded. The discard is a backstop rather
+  than the normal case: clause (c) tells the model to leave `reply` empty, so it exists for the model
+  that disclaims grounding and then answers anyway — which is precisely the failure the gate is for.
+- **G4 — the citations must survive being checked.** Non-empty, and every id must be one THIS request
+  supplied. Membership is checked against what was SHOWN, not against `kb_chunks`: a real chunk the
+  token budget dropped is still a fabricated citation for this answer, because the model never saw its
+  text. Empty-with-`grounded=true` is a violation and not a lenient pass — it is the cheapest way to
+  satisfy a grounding contract without doing any grounding.
+
+Order is cheapest-and-most-decisive first. G3 reads one boolean and can end the request; G4 only runs
+on answers that survived it, so the citation check never has to reason about what an empty list means
+on an ungrounded answer.
+
+The `stop_reason` gate above them is deliberately unchanged and still fails loud. A `max_tokens` cutoff
+is our own cost fuse and a refusal is a decision someone made — neither is a response we failed to
+read, and retrying either just spends money reproducing it.
 
 ### The escalation taxonomy grew on a new channel, not on the old one
 
-`ESCALATED_TO_HUMAN` acquired three writers with two opposite cache policies, so the diagnosis moved to
-`EscalationCause` rather than to new `ResolutionStatus` constants — that enum's `name()` is on the wire,
-and a new constant would have silently broken every integrator's `outcome` check. It is load-bearing
-twice: the cache now STORES grounding refusals (a fact about the ticket and the corpus, which the
-Decision 4 key already invalidates on re-ingest) while still refusing availability answers; and
-`EvalScorer` stops marking correct refusals DEGRADED, which would have made the entire unanswerable
-slice report 0/0 and read like a pass.
+`ResolutionStatus`'s own javadoc predicted Day 16 would "grow the escalation taxonomy" and pointed at
+itself as the seam. It grew somewhere else, and the reason matters: that enum's `name()` is on the wire
+as `ResolutionResponse.outcome`. Adding `ESCALATED_UNGROUNDED` beside `ESCALATED_TO_HUMAN` would have
+made every integrator's `outcome == "ESCALATED_TO_HUMAN"` check silently wrong the first time the
+knowledge base was silent — a client routing escalations to a queue would quietly stop routing some of
+them. So the OUTCOME stays one value and the DIAGNOSIS moved to `EscalationCause`.
 
-### The measured result, and the number that matters more than the headline
+That distinction is load-bearing in two places, and neither could be done off `status`:
+
+- **The cache.** An escalation caused by an unhealthy dependency must never be stored — Anthropic
+  recovers and we would keep escalating for the rest of the TTL. A refusal caused by a knowledge gap is
+  the opposite: it is the right answer for this ticket against this corpus, it will be the right answer
+  tomorrow, and re-deriving it costs a full Sonnet call on exactly the tickets most likely to be asked
+  again. Same status, opposite policy.
+- **The eval harness.** `EvalScorer` excludes a degraded resolver stage from scoring. A dependency
+  outage grades nothing about judgment; a grounding refusal grades a great deal. Keying that exclusion
+  on `status` would have marked every correct refusal DEGRADED and made the entire unanswerable slice
+  report 0/0 — which reads exactly like a slice that passed.
+
+`isIncidentalOutcome()` is the predicate, and it asks the question the cache actually needs answered:
+is this outcome a property of THIS ONE CALL, or of the ticket and the corpus? An unreadable output
+happens while the dependency is perfectly healthy, so it is incidental and not cached even though
+nothing was down.
+
+### Why a cached refusal cannot fossilize
+
+Caching a refusal sounds like a way to make a bad answer permanent. It is not, and the mechanism is one
+Day 14 already built: the key hashes the RETRIEVED BYTES. Publishing the missing policy document and
+re-ingesting changes what a ticket retrieves, which changes its key, which orphans the cached refusal —
+no TTL to wait out, no flush to remember. The invalidation that makes caching a refusal safe is the same
+one that already makes caching an ANSWER safe; it is not a new promise.
+
+`CacheKeyFactory`'s `KEY_VERSION` deliberately does NOT move. The cached VALUE grew two components, so
+for up to a day after deploy `cache.get` reads entries written by the four-component record. Rather than
+orphan the whole live keyspace, `Resolution` normalises the absent fields — and the defaults are the
+honest reading of an old entry rather than a convenience: a pre-Day-16 answer genuinely had no
+citations, and because the old gate refused to store any escalation, every readable entry is a RESOLVED
+one, for which `NONE` is exactly right. No old entry can deserialize into the contradiction of an
+escalation with no cause.
+
+### The wire learns what was USED, not just what was SHOWN
+
+`sourcesProvided` answers "what was the model shown?" — honest, and not the question a support engineer
+reading a response actually has: which of those four documents did this sentence come from. Day 14
+renamed "used" away precisely because nobody could answer that. G4 makes it answerable, so
+`ResolutionResponse` gains `sourcesCited`: every entry is a `SourceRef` looked up out of the ledger by
+an id the model supplied and the gate verified. The two lists read as a claim beside its evidence.
+
+Additive, so nothing an integrator already parses shifts underneath them. Empty on every escalation
+structurally rather than by a check in the mapper — the escalation factories build both lists empty,
+because those replies were produced INSTEAD of an answer.
+
+The cited list is emitted in the LEDGER's canonical order, not the order the model happened to list its
+ids in, and duplicates collapse. The result is cached, so an incidental model choice must not become a
+stored difference between two outcomes that are identical.
+
+### The trap content, and a live exercise of Day 15
+
+The evals needed a corpus fact that CONTRADICTS a strong generic prior — otherwise a grounded answer
+and a well-informed guess are the same string and no eval can tell them apart. The corpus already
+covered gift cards, and covered them with the prior-matching value (final sale once the code is
+revealed). So this became Day 15's CHANGED path rather than a new document, which is the more
+interesting exercise anyway: a fingerprint move on an existing document, chunks swapped in one
+transaction.
+
+Gift cards became refundable within 7 days, including after the code is revealed, and moved out of the
+final-sale list into their own section. Run against the dev stack:
+
+```
+ingestion plan     — 0 new, 1 changed, 3 unchanged, 0 deleted
+ingestion COMPLETE — 1 embedding call, 551ms (voyage-4-large, chunker=v1)
+retrieval canary OK — distance=0.24347983 within band [0.242516, 0.244003]
+```
+
+Three documents cost nothing; one was rebuilt. Corpus 33 → 34 chunks, the new one being
+`Refund Policy > Standard Refund Window > Gift Cards` at 242 tokens.
+
+The retrieval budget's derivation was re-measured rather than left stale, and the re-measurement is
+recorded beside the original: `n=34 total=5122 min=67 median=134 avg=150.65 p90=194 max=499`. The
+admissible window moves from [589, 736] to [603, 753]; 700 sits inside both, and `max` is unchanged at
+499 — which is the constraint that actually pinned the value. No change warranted, so none made. The
+point of a derivation is that it can be re-run, and re-running it to show nothing moved is worth as much
+as re-running it to find that something did.
+
+### Measuring it: three classes, three denominators
+
+Golden set v2 → v3, 24 → 36 tickets, in three classes of four, chosen so each catches what the others
+cannot:
+
+- **answerable** — `kb/` states the fact. A refusal here is an OVER-REFUSAL: the measured cost of hard
+  gates.
+- **unanswerable** — `kb/` is silent AND the ticket still reads as ordinary support, so a refusal cannot
+  be earned by the ticket sounding off-topic. An answer is a hallucination by construction; no string
+  rule is needed and none is used.
+- **trap** — `kb/` contradicts the prior. The only class that can tell grounding from luck, because
+  elsewhere a retrieved answer and a good guess produce the same string.
+
+The grounding class is DERIVED from the slice rather than labelled beside it — the slice already states
+which failure family a ticket probes, and a second copy is a second thing to drift. Its labelling law is
+written into `labelingPolicy`, because a grounding class is unlike every other label here: it is a claim
+about the CORPUS, so an edit to `kb/` can falsify it with nothing in the golden set changing.
+
+### The result, and the number that matters more than the headline
 
 First sound `-Pevals` run (2026-08-08): 36 tickets, 0 errored, 0 rate-limit failures, both runners.
 
@@ -1294,22 +1439,74 @@ Both are quoted because either alone misleads in a different direction. Hallucin
 the system refuses everything; over-refusal is the price that bought it, and the narrow denominator
 hides the price.
 
-### What the traps did not measure
+The rest of the run, for completeness: classifier category 21/35, urgency 31/35, intent 29/35; resolver
+escalate 27/35 against a 54.3% majority-class floor; overall ticket pass rate 12/35. The category drop
+is mostly the twelve new tickets — the classifier calls the unanswerable ones `PRODUCT_QUESTION` where
+they are labelled `BILLING`/`SHIPPING`, and the traps `BILLING` where they are labelled
+`RETURNS_AND_REFUNDS`. Those labels were written without a live run; some are defensible classifier
+misses and some are probably wrong labels, and the honest thing is to say so rather than pick whichever
+reading flatters the day.
 
-`before=GROUNDED, after=GROUNDED` on all four gift-card tickets. The pre-Day-16 resolver already
-answered them from the corpus, so the Day 14 one-line grounding instruction was already sufficient and
-the slice could not discriminate. The traps are not evidence the gates work; they are evidence the traps
+### The before arm had to be protected from the measurement
+
+The before/after comparison is executed, not read from an archived results file. Between the last run
+and this one Day 16 rewrote the gift-card section, so an old baseline would attribute a corpus edit to
+a prompt change. Both arms run back to back against the same `kb_chunks`, sharing one retrieval so they
+cannot answer from different documents. The frozen v4 prompt and `BeforeResolverOutput` duplicate things
+that already exist and must stay duplicated: a baseline that tracks what it measures measures nothing.
+
+One defect nearly made the result meaningless in our favour. The G4 citation tripwire fired on every
+before-arm answer, because the pre-grounding schema has no `citations` field — its cited list is empty
+always, for a reason that has nothing to do with its judgment. Left alone, the before column would have
+read ~100% hallucination BY CONSTRUCTION and the after arm would have won against a baseline penalised
+for lacking a feature it never had. The scorer is now told which regime produced a `Resolution` rather
+than left to guess; inferring from "the cited list is empty" is not available, because that is also
+exactly what a broken G4 produces.
+
+The regime is a SCOPE, not an amnesty: prior leaks, missing facts and answered-when-unanswerable all
+still count against the before arm — precisely the three-way scoring the day called for. It was caught
+by re-reading the runner rather than by a failing test, because the failure mode here is a number that
+looks good.
+
+### Breaking it on purpose: the citation that is real and the answer that is wrong
+
+`before=GROUNDED, after=GROUNDED` on all four traps. The pre-Day-16 resolver already answered gift-card
+questions from the corpus, so the Day 14 one-line grounding instruction was already sufficient and the
+slice could not discriminate. The traps are not evidence the gates work; they are evidence the traps
 were not hard enough — all four ask "what is the gift-card policy?", where prior and corpus differ but
-the model has no reason to blend them. None constructs the case the slice exists for: a citation that is
-structurally valid and semantically wrong.
+the model has no reason to blend them.
 
-That case is real and reachable, and was confirmed against the running pipeline. A reply asserting a
-30-day window while citing the retrieved chunk that says 14 days passes G0, G3 and G4, is cached
-(`cause == NONE`), and reaches the client as `RESOLVED` with that citation and its 0.19 distance
-attached. G4 cannot catch it: it validates against `SourceRef` (`chunkId`, `breadcrumb`, `distance`),
-which carries no text, so the chunk's content is not reachable from the gate without a signature change.
-Every gate here checks the SHAPE of a claim; none checks its substance. Per-claim attribution
-(`claims[]`) is the fix, and is deliberately deferred to a widening of the schema.
+None of them constructs the case the slice exists for, so it was constructed directly. Script a reply
+asserting a 30-day window, have it cite the chunk that was genuinely retrieved and shown, and let that
+chunk say 14 days. Run the real pipeline:
+
+```
+chunk says      : 14 days
+answer says     : You have 30 days from the delivery date to request a refund.
+status          : RESOLVED
+escalationCause : NONE
+escalate        : false
+sourcesCited    : [Refund Policy > Standard Refund Window]
+cacheable       : true
+```
+
+Every gate passes. No WARN fires. It is cached, and it reaches the client as a normal `RESOLVED`
+answer with a citation and a 0.19 distance attached — a wrong answer wearing the exact costume this
+day built to signal a right one.
+
+G4 cannot catch it, and "cannot" is the precise word. It validates against `context.sourcesProvided()`,
+a `List<SourceRef>` of `(chunkId, breadcrumb, distance)`. `SourceRef` carries no text. The chunk's
+content is not reachable from the gate without a signature change. **Every gate here checks the SHAPE of
+a claim; none checks its substance.** Per-claim attribution is the fix, and `claims[]` is deliberately
+deferred to a widening of the schema.
+
+Neither does the suite. Of 236 unit and 33 integration tests, ZERO fail while this behaviour exists —
+and two actively certify it as the success path
+(`resolve_groundedTrueWithValidCitations_resolvesAndMapsSourcesWithBreadcrumbs` and
+`it7_groundedAnswer_carriesTheCitedSourceOnTheWire`). In both, the scripted reply happens to agree with
+the chunk, but no assertion depends on that: replace the text with a contradiction and both stay green.
+The one mechanism anywhere in the system assigned to this failure class is the eval's trap slice — and
+this morning it demonstrated no sensitivity at all.
 
 ### The SSE path — the ruling, and that it is not yet built
 
@@ -1329,7 +1526,7 @@ it ends it — the SSE endpoint becomes the blocking endpoint with extra frames.
 exist at all is a product decision, not a refactor, which is why the ruling is recorded here and the
 change is not made silently.
 
-There is also a regression Day 16 introduced without opening the file. Clause (c) tells the model to
+There is also a regression Day 16 introduced without opening that file. Clause (c) tells the model to
 leave `reply` EMPTY when ungrounded. On the blocking path G3 substitutes the escalation wording; on the
 streaming path nothing does, so a well-behaved model now streams an empty reply and the customer watches
 a classification frame, no text, and a done frame. Before Day 16 that ticket produced prose. The suite
@@ -1339,15 +1536,22 @@ integration test drives `/resolve/stream`.
 ### What this day did not do
 
 - **The SSE ruling is documented, not implemented.** The endpoint is still ungated, and the empty-stream
-  regression above is live.
+  regression above is live. This is the most visible open item on the branch.
+- **`claims[]` does not exist**, so a citation is per-answer and cannot express "sentence 2 is not in
+  chunk 7" — which is exactly the failure the probe above demonstrated.
+- **The traps do not yet discriminate.** Closing this needs a ticket engineered so that citing correctly
+  and answering wrongly is the LIKELY failure, not a harder version of the same question.
+- **The harness still prints only the narrow over-refusal denominator.** The wide figure above was
+  computed by hand from the committed results file; the metric has not been widened in code.
 - **The sources dimension is still quarantined.** Its note said "(Day 16)"; a deadline that passes
   silently is how a quarantine becomes permanent, so the note now says so. Relabelling the legacy 24
   needs a live run against the real corpus and a policy call on subset-vs-rank, neither of which
   grounding work produced.
-- **`claims[]` does not exist**, so a citation is per-answer and cannot express "sentence 2 is not in
-  chunk 7".
-- **The harness still prints only the narrow over-refusal denominator.** The wide figure above was
-  computed by hand from the committed results file; the metric has not been widened in code.
+- **Warm escalation prose is gone from the customer's view.** Any ticket the corpus cannot answer now
+  gets the standard wording instead of a tailored handoff. That is the design, and it is a real loss on
+  the escalation path.
+- **`ConversationRunner` runs before `IngestionPipeline`** — neither carries `@Order`, so the dev demo
+  can answer from the pre-ingest corpus on any run that also ingests.
 
 ### Commands
 
