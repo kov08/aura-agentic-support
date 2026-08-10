@@ -37,12 +37,19 @@ import java.util.Objects;
  * Two separate constraints pin this ordering, and they pull in opposite directions:
  *
  * <ul>
- *   <li><b>{@code reply} MUST stay FIRST</b> — the SSE path
- *       ({@link org.aura.aura.streaming.StreamingReplyExtractor}) forwards the reply's characters as
- *       they arrive, so any field generated ahead of it would delay the customer's first visible
- *       character by however long that field takes to emit. The extractor also relies on nothing
- *       preceding {@code reply} so the first {@code "reply"} token in the document is always the real
- *       key rather than a substring of an earlier field's value.</li>
+ *   <li><b>{@code reply} MUST stay FIRST.</b> The constraint comes from
+ *       {@link org.aura.aura.streaming.StreamingReplyExtractor}, which forwards the reply's
+ *       characters as they arrive: any field generated ahead of it delays the customer's first
+ *       visible character, and the extractor relies on nothing preceding {@code reply} so that the
+ *       first {@code "reply"} token in the document is always the real key rather than a substring
+ *       of an earlier field's value.
+ *
+ *       <p>As of Day 16 that extractor is DORMANT — Decision 4 buffers the SSE reply behind the
+ *       grounding gates, so nothing currently reads this field incrementally, and moving it would
+ *       break no test today. The rule stands anyway, and is stated as a rule rather than as a
+ *       description for exactly that reason: Phase 4's routing restores incremental delivery on the
+ *       paths that owe no citations, and a constraint that was quietly repealed while nobody was
+ *       watching would be rediscovered as an empty customer stream.</li>
  *   <li><b>{@code grounded} MUST stay LAST</b> (Decision 3 — verdict-last). Generation is
  *       autoregressive: a field is conditioned on every field before it. Asked FIRST, "are you
  *       grounded?" is a prediction the rest of the answer then has to live up to, and the model will

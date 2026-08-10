@@ -1500,7 +1500,9 @@ content is not reachable from the gate without a signature change. **Every gate 
 a claim; none checks its substance.** Per-claim attribution is the fix, and `claims[]` is deliberately
 deferred to a widening of the schema.
 
-Neither does the suite. Of 236 unit and 33 integration tests, ZERO fail while this behaviour exists —
+Neither does the suite. Of 236 unit and 37 integration tests, ZERO fail while this behaviour exists —
+and Decision 4's four new streaming tests do not change that: they check whether an answer may be shown
+at all, which is a different question from whether it is true —
 and two actively certify it as the success path
 (`resolve_groundedTrueWithValidCitations_resolvesAndMapsSourcesWithBreadcrumbs` and
 `it7_groundedAnswer_carriesTheCitedSourceOnTheWire`). In both, the scripted reply happens to agree with
@@ -1508,35 +1510,64 @@ the chunk, but no assertion depends on that: replace the text with a contradicti
 The one mechanism anywhere in the system assigned to this failure class is the eval's trap slice — and
 this morning it demonstrated no sensitivity at all.
 
-### The SSE path — the ruling, and that it is not yet built
+### Decision 4 — the SSE path buffers, and what that cost
 
-**The SSE path buffers until G3/G4 pass. It does not forward-then-retract.**
+**The SSE path buffers until G3/G4 pass. It does not forward-then-retract.** Implemented, not merely
+ruled on.
 
-Today's code does neither: `/resolve/stream` calls `buildStreamingParams` and opens the stream directly,
-never reaching `resolve()` where the gates live, so a streamed answer is ungated end to end. It parses
-the completed envelope once and reads only `escalate`; `grounded` and `citations` are deserialized and
-dropped.
+The endpoint shipped ungated, and the shape of that miss is worth more than the fix.
+`/resolve/stream` called `buildStreamingParams` and opened the stream directly, never reaching
+`resolve()` where the gates live. Day 7's rule for this pair is "ONE prompt, TWO doors", and Day 10 held
+it for the REQUEST by routing both transports through `paramsFor`. Day 16 put every new enforcement on
+the RESPONSE, where no such seam existed — so the invariant held exactly as long as nobody added
+anything to the half it did not cover. `ResolverService.applyGroundingGates` is now that seam: a future
+G5 added there is a G5 both doors get, rather than a silent behavioural gap on one of them.
 
-Forward-then-retract is not shippable. Retracting text a customer has already read is worse than a
-spinner, and this file already refuses to do it — `parseEnvelope`: "an error frame would contradict what
-they just watched appear." So buffering is the only defensible ruling, and its cost is total rather than
-incremental: `grounded` is verdict-LAST by design, so the verdict cannot exist until the final token,
-which means no token can be shown before generation completes. Buffering does not slow streaming down,
-it ends it — the SSE endpoint becomes the blocking endpoint with extra frames. Whether it should then
-exist at all is a product decision, not a refactor, which is why the ruling is recorded here and the
-change is not made silently.
+Forward-then-retract was never shippable. Retracting text a customer has already read is worse than a
+spinner, and this file already refused to do it — `parseEnvelope`: "an error frame would contradict what
+they just watched appear." That leaves buffering, whose cost is total rather than incremental:
+`grounded` is verdict-LAST by design, so the verdict does not exist until the final token, and any
+character shown before it is unverified at the moment it is shown. **Buffering does not slow streaming
+down, it ends it.** On any gated path this endpoint is now the blocking endpoint with a richer frame
+protocol, and the name promises something it cannot currently deliver.
 
-There is also a regression Day 16 introduced without opening that file. Clause (c) tells the model to
-leave `reply` EMPTY when ungrounded. On the blocking path G3 substitutes the escalation wording; on the
-streaming path nothing does, so a well-behaved model now streams an empty reply and the customer watches
-a classification frame, no text, and a done frame. Before Day 16 that ticket produced prose. The suite
-cannot see it: the extractor tests are pure state-machine tests over hand-written envelopes, and no
-integration test drives `/resolve/stream`.
+It is kept rather than deleted, deliberately: the wire contract stays valid for integrators, the
+transport stays exercised, and Phase 4's routing can hand genuine streaming back to the tickets that owe
+no citations — which is precisely the population the wide-denominator over-refusal number identified.
+When that lands, the change is to emit inside the loop again. `StreamingReplyExtractor` is therefore
+PARKED, not dead, and says so; the `reply`-stays-first constraint it depends on is dormant rather than
+repealed, which is why `ResolverOutput` states it as a standing rule rather than as a description of
+current behaviour. If Phase 4 does not land, delete the extractor rather than let it age.
+
+Three consequences fell out of buffering, two of them improvements:
+
+- **G0 got stronger here than on the blocking path.** Nothing has been shown, so an unreadable envelope
+  can escalate instead of being logged and shrugged at. It is NOT retried, unlike `resolve()`'s G0 — a
+  stream cannot be resumed and re-opening one would re-bill the whole generation. Same method, opposite
+  downstream decision, purely because of when it runs.
+- **`DoneEvent` gains `outcome`**, additively: every existing field keeps its name, type and meaning and
+  no event was renamed. A buffered stream that could not say whether it delivered a grounded answer or
+  an escalation would leave the gates invisible to the only client that reads this endpoint. This
+  settles the note the file had carried since Day 10 that "Day 16 owns exposing escalation on the wire".
+  Citation parity does not follow — `DoneEvent` is an operational frame, and hanging a grounding receipt
+  off it would give one record two jobs.
+- **The regression Day 16 introduced is closed.** Clause (c) tells the model to leave `reply` EMPTY when
+  ungrounded; with no G3 on this path a well-behaved model produced a stream containing no text at all —
+  a classification frame, nothing, a done frame — where before Day 16 the same ticket produced prose.
+  G3 now supplies what the contract told the model not to write.
+
+The reason none of this was caught is that **no test had ever driven `/resolve/stream`**. A suite that
+never exercises a transport cannot notice when a rule stops applying to it. `StreamingGroundingIT` now
+drives the real endpoint through the real SDK, and its fixture splits the envelope across several
+`content_block_delta` frames on purpose: many fragments in and exactly ONE delta out is the assertion
+that separates buffering from forwarding, and a single-frame fixture would have passed against the old
+pump too.
 
 ### What this day did not do
 
-- **The SSE ruling is documented, not implemented.** The endpoint is still ungated, and the empty-stream
-  regression above is live. This is the most visible open item on the branch.
+- **The streaming endpoint's name outruns its behaviour.** It buffers, so it cannot deliver
+  incrementally on any gated path. Accepted deliberately (Decision 4) rather than renamed or deleted:
+  Phase 4's routing is what gives the name back its meaning.
 - **`claims[]` does not exist**, so a citation is per-answer and cannot express "sentence 2 is not in
   chunk 7" — which is exactly the failure the probe above demonstrated.
 - **The traps do not yet discriminate.** Closing this needs a ticket engineered so that citing correctly

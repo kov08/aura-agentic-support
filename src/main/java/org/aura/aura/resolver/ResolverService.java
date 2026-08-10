@@ -120,6 +120,36 @@ public class ResolverService {
         // judges whether there is one to judge. See parseOrThrow.
         ResolverOutput output = parseOrThrow(message);
 
+        return applyGroundingGates(output, context);
+    }
+
+    /**
+     * G3 and G4, over an output that has already been parsed — the ONE implementation, reachable from
+     * both transports.
+     *
+     * <h2>Why this is public, and what went wrong while it was not</h2>
+     * Day 7's rule for this pair is "ONE prompt, TWO doors", and Day 10 held it for the REQUEST by
+     * routing both transports through {@code paramsFor}. Day 16 put all of its new enforcement on the
+     * RESPONSE, and there was no equivalent seam there — so the gates were reachable only from
+     * {@link #resolve}, and {@code /resolve/stream} shipped answers no gate had ever seen. The
+     * invariant was never written down as code, so it held exactly as long as nobody added anything
+     * to the half it did not cover.
+     *
+     * <p>Extracting this is what makes the rule structural rather than remembered: a future G5 added
+     * here is a G5 both doors get, and one added inline in {@code resolve} would be a compile-time
+     * no-op for streaming rather than a silent behavioural gap.
+     *
+     * <p>Note what is deliberately NOT here: the {@code stop_reason} gate and {@link #parseOrThrow}.
+     * Those consume a {@code StructuredMessage}, which only the blocking transport has — the stream
+     * delivers its stop_reason on a {@code message_delta} frame and its payload as accumulated text.
+     * The caller is responsible for establishing that a readable {@link ResolverOutput} exists; what
+     * this method owns is judging it.
+     *
+     * @param output  a successfully parsed model output — never null
+     * @param context the block that produced the request, and therefore the only legitimate source of
+     *                citable ids
+     */
+    public Resolution applyGroundingGates(ResolverOutput output, ContextBlock context) {
         // ── THE GROUNDING GATES ──────────────────────────────────────────────────────────────────
         //
         // The prompt's <grounding> contract is SOFT: it is an instruction, and an instruction is a

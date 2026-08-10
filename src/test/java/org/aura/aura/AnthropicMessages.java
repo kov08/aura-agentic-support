@@ -96,6 +96,59 @@ final class AnthropicMessages {
         return resolverOk(citedChunkIds).setBodyDelay(delay.toMillis(), TimeUnit.MILLISECONDS);
     }
 
+    /**
+     * A streaming Messages response, as {@code text/event-stream}.
+     *
+     * <p>{@code envelopeJson} is SPLIT across several {@code content_block_delta} frames rather than
+     * sent whole, because that is the property the Day 16 buffering tests actually assert: many
+     * fragments in, exactly ONE delta out. A single-frame fixture would pass against a pump that had
+     * never stopped forwarding.
+     *
+     * <p>Built to the documented event sequence (message_start → content_block_start → N ×
+     * content_block_delta → content_block_stop → message_delta → message_stop); the SDK's own parser
+     * is what validates it, the same way ok200 is validated by round-tripping through StructuredMessage.
+     */
+    static MockResponse resolverStream(String envelopeJson, int fragments) {
+        StringBuilder body = new StringBuilder();
+        body.append(event("message_start", "{\"type\":\"message_start\",\"message\":{\"id\":\"msg_sse\","
+                + "\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-5\","
+                + "\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,"
+                + "\"usage\":{\"input_tokens\":100,\"output_tokens\":1}}}"));
+        body.append(event("content_block_start", "{\"type\":\"content_block_start\",\"index\":0,"
+                + "\"content_block\":{\"type\":\"text\",\"text\":\"\"}}"));
+
+        int size = Math.max(1, (int) Math.ceil((double) envelopeJson.length() / fragments));
+        for (int i = 0; i < envelopeJson.length(); i += size) {
+            String piece = envelopeJson.substring(i, Math.min(envelopeJson.length(), i + size));
+            body.append(event("content_block_delta", "{\"type\":\"content_block_delta\",\"index\":0,"
+                    + "\"delta\":{\"type\":\"text_delta\",\"text\":" + quote(piece) + "}}"));
+        }
+
+        body.append(event("content_block_stop", "{\"type\":\"content_block_stop\",\"index\":0}"));
+        body.append(event("message_delta", "{\"type\":\"message_delta\","
+                + "\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},"
+                + "\"usage\":{\"output_tokens\":40}}"));
+        body.append(event("message_stop", "{\"type\":\"message_stop\"}"));
+
+        return new MockResponse()
+                .setResponseCode(200)
+                .setHeader("Content-Type", "text/event-stream")
+                .setBody(body.toString());
+    }
+
+    private static String event(String name, String data) {
+        return "event: " + name + "\ndata: " + data + "\n\n";
+    }
+
+    /** JSON-quotes a fragment, so a split that lands mid-escape still produces a legal frame. */
+    private static String quote(String raw) {
+        try {
+            return MAPPER.writeValueAsString(raw);
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+    }
+
     // An Anthropic error response. The SDK maps by HTTP status: 429 -> RateLimitException,
     // 5xx incl. 529 overloaded -> InternalServerException, 4xx (e.g. 400) -> BadRequestException.
     static MockResponse error(int status, String type, String message) {

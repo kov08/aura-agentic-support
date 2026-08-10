@@ -9,8 +9,11 @@ import com.anthropic.models.messages.TextDelta;
 import lombok.extern.slf4j.Slf4j;
 import org.aura.aura.classification.ClassificationResult;
 import org.aura.aura.classification.TicketClassificationService;
+import org.aura.aura.resolver.EscalationCause;
+import org.aura.aura.resolver.Resolution;
 import org.aura.aura.resolver.ResolverOutput;
 import org.aura.aura.resolver.ResolverService;
+import org.aura.aura.retrieval.ContextBlock;
 import org.aura.aura.retrieval.RetrievalService;
 import org.aura.aura.web.dto.ClassificationResponse;
 import org.aura.aura.web.dto.ResolveTicketRequest;
@@ -83,14 +86,25 @@ public class TicketStreamingService {
     // otherwise the connection (and its pump thread) hangs until the 120s timeout.
     private void pump(String ticketId, ResolveTicketRequest request, SseEmitter emitter) {
         long startNanos = System.nanoTime();
-        // Day 10: what arrives on the wire is now the RAW structured-output envelope
-        // ({"reply":"...","escalate":...}), not customer prose. Two consumers, deliberately separate:
-        //   envelope  — accumulated verbatim, parsed ONCE at end-of-stream for schema validity + escalate.
-        //   extractor — unwraps the reply text incrementally so the customer still sees words appear
-        //               as they generate. Waiting for the envelope to complete before forwarding
-        //               anything would hand back the entire perceived-latency win Day 7 bought.
+        // Day 16 (Decision 4): THE REPLY IS BUFFERED, not forwarded as it generates.
+        //
+        // Day 10 accumulated the envelope AND forwarded the reply incrementally, because nothing then
+        // stood between the model and the customer. The grounding gates do, and they cannot run early:
+        // `grounded` is the LAST field the model emits (verdict-last, deliberately — see
+        // ResolverOutput), so the verdict does not exist until the final token. Any character shown
+        // before that is unverified at the moment it is shown.
+        //
+        // That leaves exactly two shapes and no third. Forward-then-retract means telling a customer
+        // that the paragraph they just read is withdrawn — worse than a spinner, and this file already
+        // refused to do it (see parseEnvelope). Buffer means the perceived-latency win Day 7 bought is
+        // gone on this path. Buffering is the ruling, and the cost is stated rather than softened: on
+        // any GATED path this endpoint is now the blocking endpoint with a richer frame protocol.
+        //
+        // It is kept rather than deleted because the wire contract stays valid for integrators, the
+        // transport stays exercised, and Phase 4's routing can hand genuine streaming back to the
+        // tickets that owe no citations — which is the population the wide-denominator over-refusal
+        // number identified. When that lands, the change here is to emit inside the loop again.
         StringBuilder envelope = new StringBuilder();
-        StreamingReplyExtractor replyExtractor = new StreamingReplyExtractor();
         long inputTokens = 0L;
         long cacheCreationInputTokens = 0L;  // ADR-020: prompt-cache observability, same fields as the blocking path
         long cacheReadInputTokens = 0L;
@@ -116,8 +130,14 @@ public class TicketStreamingService {
             //     but it calls the same RetrievalService with the same k, the same budget and the
             //     same dedup, so a streamed answer is grounded identically to a blocking one. Only
             //     the transport differs, which has been the rule for this pair since Day 7.
-            MessageCreateParams params = resolverService.buildStreamingParams(
-                    request.message(), retrievalService.retrieve(request.message()));
+            //     The block is held in a LOCAL rather than passed inline, because Day 16 gave it a
+            //     second reader: G4 checks the model's citations against this exact set. Retrieving
+            //     again at gate time would be a second billable embedding AND a second search whose
+            //     result could differ, so the gate would be validating against documents the model
+            //     was never shown — the same one-retrieval-per-request rule Decision 4 established
+            //     for the cache key on the blocking path.
+            ContextBlock context = retrievalService.retrieve(request.message());
+            MessageCreateParams params = resolverService.buildStreamingParams(request.message(), context);
             try (StreamResponse<RawMessageStreamEvent> stream = client.messages().createStreaming(params)) {
                 // Iterator, not forEach: send() throws checked IOException, which a Consumer lambda
                 // can't propagate. The explicit loop lets that IOException bubble to the catch below.
@@ -137,22 +157,12 @@ public class TicketStreamingService {
                     }
 
                     // content_block_delta carries a fragment of the JSON envelope — NOT customer text.
-                    // Keep the raw fragment for the end-of-stream parse, but forward only what the
-                    // extractor unwraps; sending the raw piece here is what would paint
-                    // {"reply":"I'm sorry it's tak across the customer's screen.
+                    // ACCUMULATED ONLY. Nothing is emitted from inside this loop any more: the gates
+                    // that decide whether this answer may be shown at all cannot run until the last
+                    // token has arrived, so there is no point in the stream at which forwarding a
+                    // fragment would be a decision anyone had made.
                     Optional<TextDelta> textDelta = event.contentBlockDelta().flatMap(d -> d.delta().text());
-                    if (textDelta.isPresent()) {
-                        String rawPiece = textDelta.get().text();
-                        envelope.append(rawPiece);
-
-                        String customerPiece = replyExtractor.accept(rawPiece);
-                        // Skip empty results rather than emitting a zero-length frame: while the
-                        // envelope's scaffolding streams past, the extractor legitimately has nothing
-                        // to hand over, and a client shouldn't have to filter meaningless deltas.
-                        if (!customerPiece.isEmpty()) {
-                            emitter.send(sse(SseEvents.DELTA, new DeltaEvent(customerPiece)));
-                        }
-                    }
+                    textDelta.ifPresent(delta -> envelope.append(delta.text()));
 
                     // message_delta carries the final stop_reason and the cumulative output usage.
                     if (event.messageDelta().isPresent()) {
@@ -170,21 +180,43 @@ public class TicketStreamingService {
             //     the answer we streamed is valid, just possibly cut short; the client decides.
             long elapsedMs = (System.nanoTime() - startNanos) / 1_000_000L;
 
-            // (d1) Parse the completed envelope exactly once. This is the streaming twin of the
-            //      blocking path's stop_reason gate — the schema-validity check — and the ONLY place
-            //      this path can learn the escalate verdict, since the model emits that field after
-            //      the reply text and no mid-stream frame could have carried it.
-            Optional<ResolverOutput> output = parseEnvelope(ticketId, envelope.toString());
-            Boolean escalate = output.map(ResolverOutput::escalate).orElse(null);
+            // (d1) GATE 0, and it is a stronger gate here than on the blocking path — because the
+            //      reply was buffered, a payload we cannot read costs us nothing that has already
+            //      been shown. Before Day 16 this path logged the failure and carried on, having
+            //      already streamed the text; now an unreadable envelope means grounding cannot be
+            //      verified, and an answer whose grounding is unknown does not get sent.
+            //
+            //      NOT retried, unlike the blocking path's G0. resolve() is a pure read that can be
+            //      re-issued whole; a stream cannot be resumed, and re-opening one would re-bill the
+            //      entire generation. The asymmetry is deliberate and is the cost of this transport.
+            Resolution resolution = parseEnvelope(ticketId, envelope.toString())
+                    // (d2) G3 + G4, the SAME implementation the blocking path runs — not a copy.
+                    //      This is the seam whose absence let this endpoint ship ungated.
+                    .map(output -> resolverService.applyGroundingGates(output, context))
+                    .orElseGet(() -> Resolution.escalatedToHuman(EscalationCause.OUTPUT_UNUSABLE));
 
-            // DoneEvent stays the client wire contract (stop_reason + billing tokens + latency); the
-            // cache figures are OPERATIONAL data and stay in the log line only, never leaking onto the
-            // SSE frame — same "ops data doesn't hit the wire" discipline as ResolutionResponse.
-            // `escalate` joins that operational set deliberately: the SSE event protocol stays
-            // byte-identical to Day 7's, and Day 16 owns exposing escalation on the wire.
-            emitter.send(sse(SseEvents.DONE, new DoneEvent(stopReason, inputTokens, outputTokens, elapsedMs)));
-            log.info("SSE [{}] done — stop_reason={}, escalate={}, in={}, out={}, cacheCreate={}, cacheRead={}, elapsedMs={}, envelopeChars={}",
-                    ticketId, stopReason, escalate, inputTokens, outputTokens,
+            // (d3) NOW the text goes out — one delta carrying the whole reply, then the terminal
+            //      frame. One frame rather than artificial chunking: a client that concatenates
+            //      deltas is unaffected, and faking incremental arrival for text that is already
+            //      complete would be theatre.
+            //
+            //      An escalation is emitted the same way, as ordinary reply text, because that is
+            //      what it is — a business outcome at HTTP 200 (ADR-013), not an ERROR frame. The
+            //      ERROR frame stays reserved for a transport failure, where there IS no answer.
+            emitter.send(sse(SseEvents.DELTA, new DeltaEvent(resolution.answer())));
+
+            // DoneEvent's existing fields are untouched — stop_reason, billing tokens, latency — and
+            // the cache figures stay in the log line only, same "ops data doesn't hit the wire"
+            // discipline as ResolutionResponse. `outcome` is ADDITIVE, which is what finally settles
+            // the note this file has carried since Day 10 ("Day 16 owns exposing escalation on the
+            // wire"): a buffered stream that could not tell a grounded answer from an escalation
+            // would have made the gates invisible to the only client that reads this endpoint.
+            emitter.send(sse(SseEvents.DONE, new DoneEvent(
+                    stopReason, inputTokens, outputTokens, elapsedMs, resolution.status().name())));
+            log.info("SSE [{}] done — stop_reason={}, outcome={}, cause={}, escalate={}, in={}, out={}, "
+                            + "cacheCreate={}, cacheRead={}, elapsedMs={}, envelopeChars={}",
+                    ticketId, stopReason, resolution.status(), resolution.escalationCause(),
+                    resolution.escalate(), inputTokens, outputTokens,
                     cacheCreationInputTokens, cacheReadInputTokens, elapsedMs, envelope.length());
             emitter.complete();
 
@@ -211,12 +243,17 @@ public class TicketStreamingService {
         }
     }
 
-    // Deliberately NO invented recovery on a malformed envelope (Day 8's rule: retries happen only
-    // before the first byte). By the time this runs the customer has already received the reply text
-    // — it streamed as it was generated — so retrying would duplicate output and an error frame would
-    // contradict what they just watched appear. What a failure here actually means is that the model
-    // truncated or the transport corrupted the tail, which costs us the escalate verdict and nothing
-    // else. Log it loudly for diagnosis and terminate exactly as before.
+    // Day 16 changed what an empty return here COSTS, and it is worth recording because the old
+    // comment argued the opposite conclusion from the same facts.
+    //
+    // While the reply streamed as it generated, a malformed tail arrived after the customer had
+    // already read the answer: retrying would have duplicated output and an error frame would have
+    // contradicted what they just watched appear, so the only honest move was to log it and let the
+    // stream end. The failure cost us the escalate verdict and nothing else.
+    //
+    // Buffered, nothing has been shown yet — so the caller can and does treat an unreadable envelope
+    // as a grounding failure and escalate. Same method, same log line, and the opposite downstream
+    // decision, purely because of when it now runs.
     //
     // The tail is bounded and is OUR generated reply text, not the customer's ticket — the Day 9 PII
     // rule (log the hash, never the ticket) is not weakened here.
