@@ -3,6 +3,128 @@
 AURA is a customer-support agent for ShopFast (a sample e-commerce platform), built incrementally
 on Spring Boot and the Claude Messages API. Each "Day" adds one capability on top of the last.
 
+## Architecture
+
+AURA answers one support ticket at a time, and the whole system is arranged around a single claim it
+has to be able to defend: **every ShopFast fact in a reply came from a document we can name.** The
+retrieval, the cache key, the structured output and the gates all exist to make that claim checkable
+rather than asserted.
+
+Two request paths, one offline path, two stores, two model providers.
+
+```
+  ONLINE ─ one customer ticket ────────────────────────────────────────────────────────────
+
+  POST /api/v1/tickets/{id}/resolve            POST /api/v1/tickets/{id}/resolve/stream
+                    │                                            │
+                    ▼                                            ▼
+        ┌───────────────────────────────────────────────────────────────────┐
+        │  TicketController — HTTP ⇄ domain only, zero business logic       │
+        └───────────┬───────────────────────────────────┬───────────────────┘
+                    │                                   │
+                    ▼  classify FIRST (cheap gate)      ▼
+        TicketClassificationService ──▶ Claude Haiku 4.5   (structured, own breaker)
+                    │                                   │
+                    ▼                                   ▼
+        CachedResolutionService                 TicketStreamingService
+        retrieve → key → cache-aside            retrieve → stream → BUFFER
+                    │                                   │
+                    └─────────────┬─────────────────────┘
+                                  ▼
+                        RetrievalService
+                          ├─▶ Voyage voyage-4-lite      (query lane, 1 embedding)
+                          └─▶ pgvector top-k = 8 → pack to a 700-token budget → dedup
+                                  │
+                                  ▼
+                        ContextBlockAssembler           canonical bytes + the source ledger
+                                  │
+                                  ▼
+                        ResolverService ──▶ Claude Sonnet 4.5   (structured ResolverOutput)
+                                  │
+                                  ▼
+                        G0 readable? · G3 grounded? · G4 citations real?
+                                  │
+                    ┌─────────────┴─────────────┐
+                    ▼                           ▼
+            ResolutionResponse            SSE frames
+            (JSON, sourcesCited)          (classification · delta · done)
+
+
+  OFFLINE ─ corpus maintenance, flag-gated (aura.ingest.enabled) ───────────────────────────
+
+  kb/*.md ──▶ DocumentFingerprinter ──▶ IngestionPlan (new/changed/unchanged/deleted)
+                                              │
+                                        guard: refuse destructive plans
+                                              │
+                          ┌───────────────────┴───────────────────┐
+                          ▼                                       ▼
+                  DocumentChunker                          CanaryDocument
+                          ▼                                       ▼
+              Voyage voyage-4-large  ──▶ kb_chunks          canary_probe
+              (document lane)            kb_documents       (measuring instrument,
+                                         (the ledger)        deliberately NOT retrievable)
+```
+
+### The two doors, and what makes them one system
+
+Both transports build their request through the same `paramsFor`, so the prompt, the schema and the
+generation parameters cannot drift apart, and both judge their response through the same
+`applyGroundingGates`. That second seam is newer than the first and exists because its absence was a
+real defect: Day 16 put all of its enforcement on the response, and for a while the streaming endpoint
+shipped answers no gate had ever seen.
+
+They differ in exactly two ways, both forced. The blocking path is cached; SSE is not. And SSE
+**buffers** — `grounded` is the last field the model emits, so the verdict does not exist until the
+final token, and nothing can be shown before it without showing something unverified. That ends
+incremental delivery on any gated path; the endpoint is kept because Phase 4's routing restores it for
+tickets that owe no citations.
+
+### What is stored where, and why they fail differently
+
+| store | holds | posture |
+| --- | --- | --- |
+| **Postgres + pgvector** | `kb_chunks`, `kb_documents`, `canary_probe` | system of record — the app will **not boot** without it, because Flyway migrates and Hibernate validates the schema at startup |
+| **Redis** | resolution cache, 24h TTL | cost layer — every failure mode maps to one behaviour, "miss". A cost optimisation must never become an availability dependency |
+
+The asymmetry is deliberate and is the shortest way to read the design: losing Redis costs money,
+losing Postgres means we cannot honestly answer anything.
+
+### What the customer gets when something is down
+
+| unhealthy | outcome |
+| --- | --- |
+| Anthropic — breaker open, or retries spent | HTTP **200** + `ESCALATED_TO_HUMAN` |
+| Voyage or Postgres on the read path | HTTP **200** + `ESCALATED_TO_HUMAN` |
+| The knowledge base is silent on the question | HTTP **200** + `ESCALATED_TO_HUMAN` (a correct outcome, not a failure) |
+| Redis | nothing visible — the cache fails open to a miss |
+| Anthropic returns a permanent 4xx (our bug) | HTTP **500**, RFC 9457 problem detail |
+
+One rule generates that table: **degrade on the dependency's problems, fail loud on ours.** A human
+agent is a better outcome for a customer than an error page, so an outage is a business verdict at
+HTTP 200 — but masking a malformed request of ours as an outage would let a broken deployment escalate
+every ticket while reporting itself healthy.
+
+### Guards that run before any traffic
+
+- **API keys** — `@NotBlank` on both providers' properties, so a missing key fails the context at
+  startup rather than as a 401 on the first customer's ticket.
+- **`EmbeddingDimensionCheck`** — the vector width is written down in three places (a migration, an
+  entity annotation, a property). It cannot be reduced to one, so it is checked against the live column
+  at every boot instead.
+- **`RetrievalCanaryCheck`** — embeds a frozen sentence on the query lane and measures it against the
+  stored document-lane vector. Outside a pre-registered band, the boot fails: queries and corpus have
+  drifted into different embedding spaces, which returns confident, ranked, meaningless results and
+  raises no error anywhere.
+- **Prompt version markers** — parsed from the prompt files themselves and stamped on every eval
+  result, so a score movement is always attributable to the prompt that produced it.
+
+### Where to read next
+
+[The request path, layer by layer](#request-path-post-resolve--one-layer-per-line-with-the-day-it-was-built)
+traces a single `/resolve` call through the same components with the day each was built. Everything
+after that is the incremental history — each `## Day N` section is one capability and the argument for
+building it that way.
+
 ## Prerequisites
 
 - JDK 25 (the toolchain the build targets; see `<java.version>` in [pom.xml](pom.xml))
@@ -96,11 +218,19 @@ POST /api/v1/tickets/{id}/resolve
   ▼  ResolverService.resolve ........ Day 4  · augment → resolve (Sonnet); context arrives pre-retrieved
   │      ├ @Retry + @CircuitBreaker .. Day 8  · transient allowlist retry, breaker, escalate-to-human fallback
   │      └ structured ResolverOutput . Day 10 · the escalate verdict is DATA, not prose
+  │                                    Day 16 · + citations and a verdict-last `grounded` flag
   │
   ▼  AnthropicClient (SDK) .......... Day 1  · shared OkHttp client bean, SDK retries disabled (maxRetries=0)
   │      └ base-url + timeout ........ Day 11 · configurable transport seam (prod endpoint, or MockWebServer in ITs)
   ▼
   Anthropic Messages API
+  │
+  ▼  (the reply comes back, and is judged before anyone sees it)
+  │
+  ▼  applyGroundingGates ............ Day 16 · the SAME three gates both transports run
+         ├ G0 readable? ............. Day 16 · unparseable → retry, then escalate
+         ├ G3 grounded? ............. Day 16 · model says no → escalate, discard the answer
+         └ G4 citations real? ....... Day 16 · non-empty, and every id from THIS request's excerpts
 ```
 
 Both the classifier and resolver calls go through the same SDK client, so the Day 11 base-url/timeout
